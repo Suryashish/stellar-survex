@@ -5,7 +5,7 @@ use soroban_sdk::{
     panic_with_error, Address, Env, String, Symbol, Vec,
 };
 
-// ─── Data Structures ────────────────────────────────────────────────────────
+// --- Data Structures ---
 
 #[contracttype]
 #[derive(Clone)]
@@ -19,7 +19,10 @@ pub struct Survey {
     pub status: SurveyStatus,
     pub created_at: u64,
     pub end_time: u64,
-    pub max_responses: u32, // 0 = unlimited
+    pub max_responses: u32,
+    /// Informational reward per response in stroops (1 XLM = 10_000_000 stroops).
+    /// Payment itself is settled off-contract via direct payment from the creator.
+    pub reward_per_response: i128,
 }
 
 #[contracttype]
@@ -33,21 +36,16 @@ pub enum SurveyStatus {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    // Global list of survey IDs
     IdList,
-    // Total surveys ever created
     TotalCount,
-    // Survey data by ID
     Survey(Symbol),
-    // Whether an address has responded to a survey
     Response(Symbol, Address),
-    // Whitelist: only these addresses may respond (if set)
     Whitelist(Symbol),
-    // Whether a whitelist is enabled for a survey
     WhitelistEnabled(Symbol),
+    Participants(Symbol),
 }
 
-// ─── Errors ─────────────────────────────────────────────────────────────────
+// --- Errors ---
 
 #[contracterror]
 #[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord)]
@@ -63,9 +61,10 @@ pub enum ContractError {
     NotWhitelisted    = 8,
     InvalidEndTime    = 9,
     AlreadyExists     = 10,
+    InvalidReward     = 11,
 }
 
-// ─── Contract ────────────────────────────────────────────────────────────────
+// --- Contract ---
 
 #[contract]
 pub struct SurveyBuilderContract;
@@ -73,7 +72,7 @@ pub struct SurveyBuilderContract;
 #[contractimpl]
 impl SurveyBuilderContract {
 
-    // ── Internal helpers ────────────────────────────────────────────────────
+    // -- Internal helpers --
 
     fn load_survey(env: &Env, id: &Symbol) -> Survey {
         env.storage()
@@ -99,23 +98,14 @@ impl SurveyBuilderContract {
         env.storage().instance().set(&DataKey::IdList, ids);
     }
 
-    fn assert_creator(survey: &Survey, caller: &Address) {
+    fn assert_creator(env: &Env, survey: &Survey, caller: &Address) {
         if &survey.creator != caller {
-            panic!("not authorized");
+            panic_with_error!(env, ContractError::NotAuthorized);
         }
     }
 
-    // ── Survey lifecycle ────────────────────────────────────────────────────
+    // -- Survey lifecycle --
 
-    /// Create a new survey.
-    ///
-    /// - `id`             – unique on-chain identifier (Symbol)
-    /// - `creator`        – owning address; must sign the transaction
-    /// - `title`          – non-empty human-readable title
-    /// - `description`    – free-text description
-    /// - `question_count` – number of questions (informational; answers stored off-chain)
-    /// - `end_time`       – UNIX timestamp after which responses are rejected
-    /// - `max_responses`  – response cap (0 = unlimited)
     pub fn create_survey(
         env: Env,
         id: Symbol,
@@ -125,11 +115,15 @@ impl SurveyBuilderContract {
         question_count: u32,
         end_time: u64,
         max_responses: u32,
+        reward_per_response: i128,
     ) {
         creator.require_auth();
 
         if title.len() == 0 {
             panic_with_error!(&env, ContractError::InvalidTitle);
+        }
+        if reward_per_response < 0 {
+            panic_with_error!(&env, ContractError::InvalidReward);
         }
 
         let now = env.ledger().timestamp();
@@ -153,13 +147,18 @@ impl SurveyBuilderContract {
             created_at: now,
             end_time,
             max_responses,
+            reward_per_response,
         };
 
         env.storage().instance().set(&key, &survey);
 
         let mut ids = Self::load_ids(&env);
-        ids.push_back(id);
+        ids.push_back(id.clone());
         Self::save_ids(&env, &ids);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Participants(id), &Vec::<Address>::new(&env));
 
         let count: u32 = env
             .storage()
@@ -171,11 +170,10 @@ impl SurveyBuilderContract {
             .set(&DataKey::TotalCount, &(count + 1));
     }
 
-    /// Temporarily pause a survey (creator only). Responses are blocked while paused.
     pub fn pause_survey(env: Env, id: Symbol, creator: Address) {
         creator.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&survey, &creator);
+        Self::assert_creator(&env, &survey, &creator);
 
         if survey.status != SurveyStatus::Active {
             panic_with_error!(&env, ContractError::SurveyNotActive);
@@ -185,11 +183,10 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    /// Resume a previously paused survey (creator only).
     pub fn resume_survey(env: Env, id: Symbol, creator: Address) {
         creator.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&survey, &creator);
+        Self::assert_creator(&env, &survey, &creator);
 
         if survey.status != SurveyStatus::Paused {
             panic_with_error!(&env, ContractError::SurveyNotActive);
@@ -199,22 +196,19 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    /// Permanently close a survey (creator only). Cannot be re-opened.
     pub fn close_survey(env: Env, id: Symbol, creator: Address) {
         creator.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&survey, &creator);
+        Self::assert_creator(&env, &survey, &creator);
 
         survey.status = SurveyStatus::Closed;
         Self::save_survey(&env, &survey);
     }
 
-    /// Extend the end time of an active or paused survey (creator only).
-    /// New end time must be strictly later than the current one.
     pub fn extend_survey(env: Env, id: Symbol, creator: Address, new_end_time: u64) {
         creator.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&survey, &creator);
+        Self::assert_creator(&env, &survey, &creator);
 
         if survey.status == SurveyStatus::Closed {
             panic_with_error!(&env, ContractError::SurveyNotActive);
@@ -227,24 +221,33 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    // ── Whitelist management ─────────────────────────────────────────────────
+    pub fn update_reward(env: Env, id: Symbol, creator: Address, reward_per_response: i128) {
+        creator.require_auth();
+        let mut survey = Self::load_survey(&env, &id);
+        Self::assert_creator(&env, &survey, &creator);
 
-    /// Enable a whitelist for a survey. Only whitelisted addresses can respond.
-    /// Call `add_to_whitelist` afterwards to populate it.
+        if reward_per_response < 0 {
+            panic_with_error!(&env, ContractError::InvalidReward);
+        }
+        survey.reward_per_response = reward_per_response;
+        Self::save_survey(&env, &survey);
+    }
+
+    // -- Whitelist --
+
     pub fn enable_whitelist(env: Env, id: Symbol, creator: Address) {
         creator.require_auth();
         let survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&survey, &creator);
+        Self::assert_creator(&env, &survey, &creator);
         env.storage()
             .instance()
             .set(&DataKey::WhitelistEnabled(id), &true);
     }
 
-    /// Add addresses to a survey's whitelist (creator only).
     pub fn add_to_whitelist(env: Env, id: Symbol, creator: Address, addresses: Vec<Address>) {
         creator.require_auth();
         let survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&survey, &creator);
+        Self::assert_creator(&env, &survey, &creator);
 
         let wl_key = DataKey::Whitelist(id);
         let mut wl: Vec<Address> = env
@@ -259,13 +262,8 @@ impl SurveyBuilderContract {
         env.storage().instance().set(&wl_key, &wl);
     }
 
-    // ── Response submission ──────────────────────────────────────────────────
+    // -- Response submission --
 
-    /// Submit a response to a survey.
-    ///
-    /// `answers` is an opaque string — encode your answers however suits your
-    /// frontend (JSON, CSV, base64, etc.). The contract records participation
-    /// on-chain; answer data lives off-chain or in a separate storage layer.
     pub fn submit_response(
         env: Env,
         survey_id: Symbol,
@@ -273,33 +271,28 @@ impl SurveyBuilderContract {
         answers: String,
     ) {
         respondent.require_auth();
-        let _ = answers; // stored off-chain; tracked on-chain via the Response key
+        let _ = answers;
 
         let mut survey = Self::load_survey(&env, &survey_id);
 
-        // Status check
         if survey.status != SurveyStatus::Active {
             panic_with_error!(&env, ContractError::SurveyNotActive);
         }
 
-        // Expiry check
         let now = env.ledger().timestamp();
         if now > survey.end_time {
             panic_with_error!(&env, ContractError::SurveyExpired);
         }
 
-        // Response cap check
         if survey.max_responses > 0 && survey.response_count >= survey.max_responses {
             panic_with_error!(&env, ContractError::ResponseLimitHit);
         }
 
-        // Duplicate response check
         let resp_key = DataKey::Response(survey_id.clone(), respondent.clone());
         if env.storage().instance().has(&resp_key) {
             panic_with_error!(&env, ContractError::AlreadyResponded);
         }
 
-        // Whitelist check
         let wl_enabled: bool = env
             .storage()
             .instance()
@@ -319,11 +312,18 @@ impl SurveyBuilderContract {
             }
         }
 
-        // Record response
         env.storage().instance().set(&resp_key, &true);
         survey.response_count += 1;
 
-        // Auto-close when cap is reached
+        let part_key = DataKey::Participants(survey_id.clone());
+        let mut participants: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&part_key)
+            .unwrap_or(Vec::new(&env));
+        participants.push_back(respondent);
+        env.storage().instance().set(&part_key, &participants);
+
         if survey.max_responses > 0 && survey.response_count >= survey.max_responses {
             survey.status = SurveyStatus::Closed;
         }
@@ -331,19 +331,16 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    // ── Read-only queries ────────────────────────────────────────────────────
+    // -- Read-only queries --
 
-    /// Fetch full survey data. Returns `None` if the ID doesn't exist.
     pub fn get_survey(env: Env, id: Symbol) -> Option<Survey> {
         env.storage().instance().get(&DataKey::Survey(id))
     }
 
-    /// Return all survey IDs registered on-chain (insertion order).
     pub fn list_surveys(env: Env) -> Vec<Symbol> {
         Self::load_ids(&env)
     }
 
-    /// Total number of surveys ever created (never decrements).
     pub fn get_total_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -351,7 +348,6 @@ impl SurveyBuilderContract {
             .unwrap_or(0)
     }
 
-    /// Current response count for a survey. Returns 0 if not found.
     pub fn get_response_count(env: Env, survey_id: Symbol) -> u32 {
         match env
             .storage()
@@ -363,14 +359,12 @@ impl SurveyBuilderContract {
         }
     }
 
-    /// Check whether a specific address has already responded.
     pub fn has_responded(env: Env, survey_id: Symbol, respondent: Address) -> bool {
         env.storage()
             .instance()
             .has(&DataKey::Response(survey_id, respondent))
     }
 
-    /// Check whether a survey is still accepting responses right now.
     pub fn is_accepting_responses(env: Env, survey_id: Symbol) -> bool {
         let survey: Option<Survey> = env
             .storage()
@@ -386,5 +380,12 @@ impl SurveyBuilderContract {
                     && (s.max_responses == 0 || s.response_count < s.max_responses)
             }
         }
+    }
+
+    pub fn get_participants(env: Env, survey_id: Symbol) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Participants(survey_id))
+            .unwrap_or(Vec::new(&env))
     }
 }
