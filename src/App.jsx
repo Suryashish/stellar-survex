@@ -1,309 +1,556 @@
-import React, { useState, useRef, useEffect } from "react";
-import { checkConnection, createSurvey, submitResponse, closeSurvey, getSurvey, listSurveys, getResponseCount, hasResponded, getSurveyCount } from "../lib.js/stellar.js";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import "./App.css";
+import {
+    checkConnection,
+    connectWallet,
+    disconnectWallet,
+    getActiveNetwork,
+    createSurvey,
+    pauseSurvey,
+    resumeSurvey,
+    closeSurvey,
+    extendSurvey,
+    enableWhitelist,
+    addToWhitelist,
+    submitResponse,
+    getSurvey,
+    listSurveys,
+    getTotalCount,
+    getResponseCount,
+    hasResponded,
+    isAcceptingResponses,
+    CONTRACT_ID,
+    NETWORK_NAME,
+} from "../lib/stellar.js";
 
 const nowTs = () => Math.floor(Date.now() / 1000);
+const dayFromNow = () => nowTs() + 86400;
 
-const toOutput = (value) => {
+const truncate = (addr) => (!addr || addr.length < 12 ? addr || "" : `${addr.slice(0, 6)}…${addr.slice(-4)}`);
+
+const formatTime = (ts) => {
+    const n = Number(ts);
+    if (!n) return "—";
+    return new Date(n * 1000).toLocaleString();
+};
+
+const statusLabel = (status) => {
+    if (status == null) return "—";
+    if (typeof status === "string") return status;
+    if (typeof status === "object" && "tag" in status) return status.tag;
+    return String(status);
+};
+
+const stringify = (value) => {
+    if (value == null) return "No data returned.";
     if (typeof value === "string") return value;
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(
+        value,
+        (_, v) => (typeof v === "bigint" ? v.toString() : v),
+        2,
+    );
 };
 
-const truncateAddress = (addr) => {
-    if (!addr || addr.length < 12) return addr;
-    return addr.slice(0, 6) + "..." + addr.slice(-4);
-};
+const TABS = [
+    { key: "create", label: "01 / Create" },
+    { key: "manage", label: "02 / Manage" },
+    { key: "respond", label: "03 / Respond" },
+    { key: "analytics", label: "04 / Analytics" },
+];
 
 export default function App() {
+    const [wallet, setWallet] = useState(null);
+    const [network, setNetwork] = useState("");
+    const [activeTab, setActiveTab] = useState("create");
+    const [busy, setBusy] = useState(false);
+    const [activeAction, setActiveAction] = useState(null);
+    const [toast, setToast] = useState(null);
+    const [output, setOutput] = useState({ kind: "idle", value: "" });
+    const [totalCount, setTotalCount] = useState(null);
+    const [confirmKey, setConfirmKey] = useState(null);
+    const confirmTimer = useRef(null);
+
     const [form, setForm] = useState({
         id: "survey1",
-        creator: "",
         title: "Developer Satisfaction Survey",
         description: "Rate your experience with Soroban",
         questionCount: "5",
-        endTime: String(nowTs() + 86400),
-        respondent: "",
+        endTime: String(dayFromNow()),
+        maxResponses: "0",
+        manageId: "survey1",
+        newEndTime: String(dayFromNow() + 86400),
+        whitelistAddrs: "",
+        respondId: "survey1",
         answers: "5,4,3,5,4",
+        querySurveyId: "survey1",
+        queryRespondent: "",
     });
-    const [output, setOutput] = useState("");
-    const [walletState, setWalletState] = useState("Wallet: not connected");
-    const [isBusy, setIsBusy] = useState(false);
-    const [countValue, setCountValue] = useState("-");
-    const [loadingAction, setLoadingAction] = useState(null);
-    const [status, setStatus] = useState("idle");
-    const [activeTab, setActiveTab] = useState(0);
-    const [connectedAddress, setConnectedAddress] = useState("");
-    const [confirmAction, setConfirmAction] = useState(null);
-    const confirmTimer = useRef(null);
-
-    useEffect(() => {
-        return () => { if (confirmTimer.current) clearTimeout(confirmTimer.current); };
-    }, []);
 
     const setField = (event) => {
         const { name, value } = event.target;
         setForm((prev) => ({ ...prev, [name]: value }));
     };
 
-    const runAction = async (actionName, action) => {
-        setIsBusy(true);
-        setLoadingAction(actionName);
-        setStatus("idle");
+    useEffect(() => {
+        return () => confirmTimer.current && clearTimeout(confirmTimer.current);
+    }, []);
+
+    const showToast = useCallback((kind, message) => {
+        setToast({ kind, message });
+        setTimeout(() => setToast(null), 3500);
+    }, []);
+
+    const refreshTotal = useCallback(async () => {
         try {
-            const result = await action();
-            setOutput(toOutput(result ?? "No data found"));
-            setStatus("success");
+            const value = await getTotalCount();
+            setTotalCount(typeof value === "bigint" ? Number(value) : value ?? 0);
+        } catch {
+            setTotalCount(null);
+        }
+    }, []);
+
+    useEffect(() => {
+        (async () => {
+            try {
+                const user = await checkConnection();
+                if (user) {
+                    setWallet(user);
+                    const net = await getActiveNetwork();
+                    setNetwork(net);
+                }
+            } catch {
+                /* ignore */
+            }
+            refreshTotal();
+        })();
+    }, [refreshTotal]);
+
+    const run = async (actionKey, fn, { successMessage, refresh } = {}) => {
+        setBusy(true);
+        setActiveAction(actionKey);
+        setOutput({ kind: "loading", value: "Awaiting network…" });
+        try {
+            const result = await fn();
+            setOutput({ kind: "success", value: stringify(result) });
+            showToast("success", successMessage || "Action completed");
+            if (refresh) await refreshTotal();
+            return result;
         } catch (error) {
-            setOutput(error?.message || String(error));
-            setStatus("error");
+            const message = error?.message || String(error);
+            setOutput({ kind: "error", value: message });
+            showToast("error", message.length > 90 ? `${message.slice(0, 90)}…` : message);
         } finally {
-            setIsBusy(false);
-            setLoadingAction(null);
+            setBusy(false);
+            setActiveAction(null);
         }
     };
 
-    const handleConfirm = (actionName, action) => {
-        if (confirmAction === actionName) {
-            setConfirmAction(null);
+    const onConnect = () =>
+        run("connect", async () => {
+            const user = await connectWallet();
+            setWallet(user);
+            const net = await getActiveNetwork();
+            setNetwork(net);
+            return { connected: true, address: user.publicKey, network: net };
+        }, { successMessage: "Wallet connected" });
+
+    const onDisconnect = async () => {
+        await disconnectWallet();
+        setWallet(null);
+        setNetwork("");
+        setOutput({ kind: "idle", value: "" });
+        showToast("info", "Wallet disconnected");
+    };
+
+    const requireWallet = () => {
+        if (!wallet) {
+            showToast("error", "Connect Freighter first");
+            return false;
+        }
+        return true;
+    };
+
+    const onCreate = () => {
+        if (!requireWallet()) return;
+        run("create", () => createSurvey({
+            id: form.id.trim(),
+            creator: wallet.publicKey,
+            title: form.title.trim(),
+            description: form.description.trim(),
+            questionCount: form.questionCount.trim(),
+            endTime: form.endTime.trim(),
+            maxResponses: form.maxResponses.trim(),
+        }), { successMessage: "Survey created", refresh: true });
+    };
+
+    const onPause = () => {
+        if (!requireWallet()) return;
+        run("pause", () => pauseSurvey({ id: form.manageId.trim(), creator: wallet.publicKey }),
+            { successMessage: "Survey paused" });
+    };
+
+    const onResume = () => {
+        if (!requireWallet()) return;
+        run("resume", () => resumeSurvey({ id: form.manageId.trim(), creator: wallet.publicKey }),
+            { successMessage: "Survey resumed" });
+    };
+
+    const handleConfirm = (key, action) => {
+        if (confirmKey === key) {
+            setConfirmKey(null);
             if (confirmTimer.current) clearTimeout(confirmTimer.current);
             action();
         } else {
-            setConfirmAction(actionName);
+            setConfirmKey(key);
             if (confirmTimer.current) clearTimeout(confirmTimer.current);
-            confirmTimer.current = setTimeout(() => setConfirmAction(null), 3000);
+            confirmTimer.current = setTimeout(() => setConfirmKey(null), 3000);
         }
     };
 
-    const onConnect = () => runAction("connect", async () => {
-        const user = await checkConnection();
-        const nextWalletState = user ? `Wallet: ${user.publicKey}` : "Wallet: not connected";
-        setWalletState(nextWalletState);
-        if (user) {
-            setConnectedAddress(user.publicKey);
-            setForm((prev) => ({
-                ...prev,
-                creator: prev.creator || user.publicKey,
-                respondent: prev.respondent || user.publicKey,
-            }));
+    const onClose = () => {
+        if (!requireWallet()) return;
+        handleConfirm("close", () =>
+            run("close", () => closeSurvey({ id: form.manageId.trim(), creator: wallet.publicKey }),
+                { successMessage: "Survey closed" }));
+    };
+
+    const onExtend = () => {
+        if (!requireWallet()) return;
+        run("extend", () => extendSurvey({
+            id: form.manageId.trim(),
+            creator: wallet.publicKey,
+            newEndTime: form.newEndTime.trim(),
+        }), { successMessage: "Survey extended" });
+    };
+
+    const onEnableWhitelist = () => {
+        if (!requireWallet()) return;
+        run("enable_wl", () => enableWhitelist({ id: form.manageId.trim(), creator: wallet.publicKey }),
+            { successMessage: "Whitelist enabled" });
+    };
+
+    const onAddWhitelist = () => {
+        if (!requireWallet()) return;
+        const addresses = form.whitelistAddrs
+            .split(/[\s,]+/)
+            .map((value) => value.trim())
+            .filter(Boolean);
+        if (!addresses.length) {
+            showToast("error", "Enter at least one address");
+            return;
         }
-        return nextWalletState;
-    });
+        run("add_wl", () => addToWhitelist({
+            id: form.manageId.trim(),
+            creator: wallet.publicKey,
+            addresses,
+        }), { successMessage: `Added ${addresses.length} address(es)` });
+    };
 
-    const onCreateSurvey = () => runAction("createSurvey", async () => createSurvey({
-        id: form.id.trim(),
-        creator: form.creator.trim(),
-        title: form.title.trim(),
-        description: form.description.trim(),
-        questionCount: form.questionCount.trim(),
-        endTime: form.endTime.trim(),
-    }));
+    const onSubmitResponse = () => {
+        if (!requireWallet()) return;
+        run("respond", () => submitResponse({
+            surveyId: form.respondId.trim(),
+            respondent: wallet.publicKey,
+            answers: form.answers.trim(),
+        }), { successMessage: "Response submitted" });
+    };
 
-    const onSubmitResponse = () => runAction("submitResponse", async () => submitResponse({
-        surveyId: form.id.trim(),
-        respondent: form.respondent.trim(),
-        answers: form.answers.trim(),
-    }));
+    const onGetSurvey = () =>
+        run("getSurvey", async () => {
+            const data = await getSurvey(form.querySurveyId.trim());
+            if (!data) return "Survey not found.";
+            return {
+                id: typeof data.id === "string" ? data.id : String(data.id),
+                creator: data.creator,
+                title: data.title,
+                description: data.description,
+                question_count: Number(data.question_count),
+                response_count: Number(data.response_count),
+                max_responses: Number(data.max_responses),
+                status: statusLabel(data.status),
+                created_at: formatTime(data.created_at),
+                end_time: formatTime(data.end_time),
+            };
+        });
 
-    const onCloseSurvey = () => handleConfirm("closeSurvey", () => runAction("closeSurvey", async () => closeSurvey({
-        id: form.id.trim(),
-        creator: form.creator.trim(),
-    })));
+    const onListSurveys = () => run("list", () => listSurveys());
 
-    const onGetSurvey = () => runAction("getSurvey", async () => getSurvey(form.id.trim()));
+    const onResponseCount = () =>
+        run("respCount", async () => {
+            const value = await getResponseCount(form.querySurveyId.trim());
+            return { surveyId: form.querySurveyId.trim(), responseCount: Number(value) };
+        });
 
-    const onList = () => runAction("list", async () => listSurveys());
+    const onHasResponded = () =>
+        run("hasResp", async () => {
+            const target = form.queryRespondent.trim() || wallet?.publicKey;
+            if (!target) throw new Error("Provide a respondent address or connect a wallet");
+            const value = await hasResponded(form.querySurveyId.trim(), target);
+            return { surveyId: form.querySurveyId.trim(), respondent: target, hasResponded: Boolean(value) };
+        });
 
-    const onResponseCount = () => runAction("responseCount", async () => {
-        const value = await getResponseCount(form.id.trim());
-        return { responseCount: value };
-    });
+    const onIsAccepting = () =>
+        run("accepting", async () => {
+            const value = await isAcceptingResponses(form.querySurveyId.trim());
+            return { surveyId: form.querySurveyId.trim(), accepting: Boolean(value) };
+        });
 
-    const onHasResponded = () => runAction("hasResponded", async () => {
-        const value = await hasResponded(form.id.trim(), form.respondent.trim());
-        return { hasResponded: value };
-    });
+    const onTotalCount = () =>
+        run("total", async () => {
+            const value = await getTotalCount();
+            const num = typeof value === "bigint" ? Number(value) : Number(value || 0);
+            setTotalCount(num);
+            return { totalSurveys: num };
+        });
 
-    const onCount = () => runAction("count", async () => {
-        const value = await getSurveyCount();
-        setCountValue(String(value));
-        return { count: value };
-    });
-
-    const tabs = ["Create Survey", "Respond", "Analytics"];
+    const ActionBtn = ({ id, label, variant, onClick, confirmLabel }) => (
+        <button
+            type="button"
+            className={`btn btn-${variant || "primary"} ${activeAction === id ? "is-loading" : ""}`}
+            onClick={onClick}
+            disabled={busy}
+        >
+            {confirmKey === id ? confirmLabel || "Confirm?" : label}
+        </button>
+    );
 
     return (
-        <main className="app">
-            {/* ---- Wallet Status Bar ---- */}
-            <div className="wallet-status-bar">
-                <span className={`wallet-dot ${connectedAddress ? "connected" : ""}`} />
-                <span className="wallet-status-text">
-                    {connectedAddress ? truncateAddress(connectedAddress) : "Not connected"}
-                </span>
-            </div>
+        <div className="page">
+            <div className="grain" aria-hidden="true" />
 
-            {/* ---- Hero ---- */}
-            <section className="hero">
-                <div className="hero-icon">&#9745;</div>
-                <h1>Survey Builder</h1>
-                <p className="subtitle">Create surveys, collect responses, and analyze results on-chain.</p>
-
-                <div className="wallet-bar">
-                    <button type="button" id="connectWallet" onClick={onConnect} className={loadingAction === "connect" ? "btn-loading" : ""} disabled={isBusy}>
-                        Connect Freighter
-                    </button>
-                    <span className="wallet-text" id="walletState">{walletState}</span>
+            {/* Top bar */}
+            <header className="topbar">
+                <div className="brand">
+                    <div className="brand-mark">SB</div>
+                    <div className="brand-text">
+                        <strong>Survey Builder</strong>
+                        <span>On-chain · Soroban</span>
+                    </div>
                 </div>
 
-                <p className="survey-count">
-                    Total surveys: <span className="counter-badge">{countValue}</span>
-                </p>
-            </section>
-
-            {/* ---- Tab Navigation ---- */}
-            <div className="tab-bar">
-                {tabs.map((tab, i) => (
-                    <button
-                        key={tab}
-                        type="button"
-                        className={`tab-btn ${activeTab === i ? "active" : ""}`}
-                        onClick={() => setActiveTab(i)}
-                    >
-                        {tab}
-                    </button>
-                ))}
-            </div>
-
-            {/* ---- Tab 0: Create Survey ---- */}
-            {activeTab === 0 && (
-                <section className="card">
-                    <div className="card-header">
-                        <span className="card-icon">&#128203;</span>
-                        <h2>Create Survey</h2>
-                        <div className="question-counter">
-                            Questions: <span className="counter-badge">{form.questionCount || "0"}</span>
-                        </div>
-                    </div>
-                    <div className="card-body">
-                        <div className="form-stack">
-                            <div className="form-row">
-                                <div className="field">
-                                    <label htmlFor="id">Survey ID (Symbol)</label>
-                                    <input id="id" name="id" value={form.id} onChange={setField} />
-                                    <span className="field-helper">Unique survey identifier</span>
-                                </div>
-                                <div className="field">
-                                    <label htmlFor="creator">Creator Address</label>
-                                    <input id="creator" name="creator" value={form.creator} onChange={setField} placeholder="G..." />
-                                    <span className="field-helper">Auto-filled on wallet connect</span>
-                                </div>
-                            </div>
-                            <div className="field">
-                                <label htmlFor="title">Survey Title</label>
-                                <input id="title" name="title" value={form.title} onChange={setField} />
-                            </div>
-                            <div className="field">
-                                <label htmlFor="description">Description</label>
-                                <textarea id="description" name="description" rows="2" value={form.description} onChange={setField} />
-                            </div>
-                            <div className="form-row">
-                                <div className="field">
-                                    <label htmlFor="questionCount">Question Count</label>
-                                    <input id="questionCount" name="questionCount" value={form.questionCount} onChange={setField} type="number" />
-                                </div>
-                                <div className="field">
-                                    <label htmlFor="endTime">End Time (unix timestamp)</label>
-                                    <input id="endTime" name="endTime" value={form.endTime} onChange={setField} type="number" />
-                                    <span className="field-helper">Survey closes at this timestamp</span>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="actions">
-                            <button type="button" className={`btn ${loadingAction === "createSurvey" ? "btn-loading" : ""}`} onClick={onCreateSurvey} disabled={isBusy}>Create Survey</button>
-                        </div>
-                    </div>
-                </section>
-            )}
-
-            {/* ---- Tab 1: Respond ---- */}
-            {activeTab === 1 && (
-                <section className="card">
-                    <div className="card-header">
-                        <span className="card-icon">&#128172;</span>
-                        <h2>Submit Response</h2>
-                    </div>
-                    <div className="card-body">
-                        <div className="form-stack">
-                            <div className="field">
-                                <label htmlFor="respondent">Respondent Address</label>
-                                <input id="respondent" name="respondent" value={form.respondent} onChange={setField} placeholder="G..." />
-                                <span className="field-helper">Your Stellar address (auto-filled on connect)</span>
-                            </div>
-                            <div className="field">
-                                <label htmlFor="answers">Answers (delimited string)</label>
-                                <textarea id="answers" name="answers" rows="2" value={form.answers} onChange={setField} />
-                                <span className="field-helper">Comma-separated answer values, e.g. 5,4,3,5,4</span>
-                            </div>
-                        </div>
-
-                        <div className="actions">
-                            <button type="button" className={`btn ${loadingAction === "submitResponse" ? "btn-loading" : ""}`} onClick={onSubmitResponse} disabled={isBusy}>Submit Response</button>
-                            <button
-                                type="button"
-                                className={`btn btn-danger ${loadingAction === "closeSurvey" ? "btn-loading" : ""}`}
-                                onClick={onCloseSurvey}
-                                disabled={isBusy}
-                            >
-                                {confirmAction === "closeSurvey" ? "Confirm Close?" : "Close Survey"}
+                <div className="topbar-meta">
+                    <span className={`pill ${wallet ? "pill-on" : "pill-off"}`}>
+                        <span className="pill-dot" />
+                        {wallet ? truncate(wallet.publicKey) : "Disconnected"}
+                    </span>
+                    {wallet ? (
+                        <>
+                            <span className="pill pill-net">{network || NETWORK_NAME}</span>
+                            <button type="button" className="btn btn-ghost btn-sm" onClick={onDisconnect} disabled={busy}>
+                                Disconnect
                             </button>
+                        </>
+                    ) : (
+                        <button
+                            type="button"
+                            className={`btn btn-primary btn-sm ${activeAction === "connect" ? "is-loading" : ""}`}
+                            onClick={onConnect}
+                            disabled={busy}
+                        >
+                            Connect Freighter
+                        </button>
+                    )}
+                </div>
+            </header>
+
+            <main className="main">
+                {/* Hero */}
+                <section className="hero card">
+                    <div className="hero-left">
+                        <span className="eyebrow">Stellar · Testnet</span>
+                        <h1>Build surveys.<br />Collect proof on-chain.</h1>
+                        <p>
+                            Create, gate, and analyze surveys backed by a Soroban contract.
+                            Lifecycle controls, optional whitelists, deduped responses — all
+                            on a public ledger.
+                        </p>
+                        <div className="hero-actions">
+                            <ActionBtn id="total" label="Refresh Total" variant="outline" onClick={onTotalCount} />
+                            <a className="btn btn-ghost" href={`https://stellar.expert/explorer/testnet/contract/${CONTRACT_ID}`} target="_blank" rel="noreferrer">
+                                View Contract ↗
+                            </a>
+                        </div>
+                    </div>
+                    <div className="hero-right">
+                        <div className="stat-card stat-1">
+                            <span className="stat-label">Total Surveys</span>
+                            <span className="stat-value">{totalCount == null ? "—" : totalCount}</span>
+                        </div>
+                        <div className="stat-card stat-2">
+                            <span className="stat-label">Network</span>
+                            <span className="stat-value mono small">{network || NETWORK_NAME}</span>
+                        </div>
+                        <div className="stat-card stat-3">
+                            <span className="stat-label">Contract</span>
+                            <span className="stat-value mono tiny">{truncate(CONTRACT_ID)}</span>
                         </div>
                     </div>
                 </section>
-            )}
 
-            {/* ---- Tab 2: Analytics ---- */}
-            {activeTab === 2 && (
-                <>
-                    <section className="card">
-                        <div className="card-header">
-                            <span className="card-icon">&#128202;</span>
-                            <h2>Survey Analytics</h2>
+                {/* Tabs */}
+                <nav className="tabs">
+                    {TABS.map((tab) => (
+                        <button
+                            key={tab.key}
+                            type="button"
+                            className={`tab ${activeTab === tab.key ? "tab-active" : ""}`}
+                            onClick={() => setActiveTab(tab.key)}
+                        >
+                            {tab.label}
+                        </button>
+                    ))}
+                </nav>
+
+                {/* Tab content */}
+                {activeTab === "create" && (
+                    <section className="card panel">
+                        <div className="panel-head">
+                            <h2>Create a Survey</h2>
+                            <span className="panel-tag">create_survey</span>
                         </div>
-                        <div className="card-body">
-                            <div className="actions">
-                                <button type="button" className={`btn btn-outline ${loadingAction === "responseCount" ? "btn-loading" : ""}`} onClick={onResponseCount} disabled={isBusy}>Response Count</button>
-                                <button type="button" className={`btn btn-outline ${loadingAction === "hasResponded" ? "btn-loading" : ""}`} onClick={onHasResponded} disabled={isBusy}>Has Responded?</button>
-                            </div>
+                        <div className="grid-2">
+                            <Field label="Survey ID (Symbol)" name="id" value={form.id} onChange={setField} hint="Unique on-chain identifier (max 32 chars)" />
+                            <Field label="Title" name="title" value={form.title} onChange={setField} />
+                            <Field label="Question Count" name="questionCount" type="number" value={form.questionCount} onChange={setField} />
+                            <Field label="Max Responses" name="maxResponses" type="number" value={form.maxResponses} onChange={setField} hint="0 = unlimited" />
+                            <Field label="End Time (UNIX)" name="endTime" type="number" value={form.endTime} onChange={setField} hint={`Now: ${nowTs()}`} />
+                            <Field label="Creator" value={wallet ? wallet.publicKey : "Connect wallet to auto-fill"} readOnly />
+                        </div>
+                        <Field label="Description" name="description" textarea rows={3} value={form.description} onChange={setField} />
+                        <div className="row">
+                            <ActionBtn id="create" label="Create Survey" onClick={onCreate} />
                         </div>
                     </section>
+                )}
 
-                    <section className="card">
-                        <div className="card-header">
-                            <span className="card-icon">&#128209;</span>
-                            <h2>Responses Log</h2>
+                {activeTab === "manage" && (
+                    <section className="card panel">
+                        <div className="panel-head">
+                            <h2>Manage a Survey</h2>
+                            <span className="panel-tag">creator-only</span>
                         </div>
-                        <div className="card-body">
-                            <div className="actions">
-                                <button type="button" className={`btn btn-ghost ${loadingAction === "getSurvey" ? "btn-loading" : ""}`} onClick={onGetSurvey} disabled={isBusy}>Get Survey</button>
-                                <button type="button" className={`btn btn-ghost ${loadingAction === "list" ? "btn-loading" : ""}`} onClick={onList} disabled={isBusy}>List Surveys</button>
-                                <button type="button" className={`btn btn-ghost ${loadingAction === "count" ? "btn-loading" : ""}`} onClick={onCount} disabled={isBusy}>Get Survey Count</button>
-                            </div>
+                        <div className="grid-2">
+                            <Field label="Survey ID" name="manageId" value={form.manageId} onChange={setField} />
+                            <Field label="New End Time (UNIX)" name="newEndTime" type="number" value={form.newEndTime} onChange={setField} />
+                        </div>
+                        <div className="row wrap">
+                            <ActionBtn id="pause" label="Pause" variant="outline" onClick={onPause} />
+                            <ActionBtn id="resume" label="Resume" variant="outline" onClick={onResume} />
+                            <ActionBtn id="extend" label="Extend End Time" variant="outline" onClick={onExtend} />
+                            <ActionBtn id="close" label="Close Survey" variant="danger" onClick={onClose} confirmLabel="Confirm Close?" />
+                        </div>
+
+                        <div className="divider" />
+
+                        <h3 className="subhead">Whitelist</h3>
+                        <Field
+                            label="Addresses (comma or newline separated)"
+                            name="whitelistAddrs"
+                            textarea
+                            rows={3}
+                            value={form.whitelistAddrs}
+                            onChange={setField}
+                            hint="Each address must be a valid G... Stellar account"
+                        />
+                        <div className="row wrap">
+                            <ActionBtn id="enable_wl" label="Enable Whitelist" variant="outline" onClick={onEnableWhitelist} />
+                            <ActionBtn id="add_wl" label="Add to Whitelist" onClick={onAddWhitelist} />
                         </div>
                     </section>
-                </>
-            )}
+                )}
 
-            {/* ---- Output ---- */}
-            <section className="card output-card">
-                <div className="card-header">
-                    <span className="card-icon">&#128196;</span>
-                    <h2>Output</h2>
+                {activeTab === "respond" && (
+                    <section className="card panel">
+                        <div className="panel-head">
+                            <h2>Submit Response</h2>
+                            <span className="panel-tag">submit_response</span>
+                        </div>
+                        <div className="grid-2">
+                            <Field label="Survey ID" name="respondId" value={form.respondId} onChange={setField} />
+                            <Field label="Respondent" value={wallet ? wallet.publicKey : "Connect wallet"} readOnly />
+                        </div>
+                        <Field
+                            label="Answers (free-form string)"
+                            name="answers"
+                            textarea
+                            rows={3}
+                            value={form.answers}
+                            onChange={setField}
+                            hint="Encode answers as JSON, CSV, base64 — your call. Stored off-chain; participation tracked on-chain."
+                        />
+                        <div className="row">
+                            <ActionBtn id="respond" label="Submit Response" onClick={onSubmitResponse} />
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === "analytics" && (
+                    <section className="card panel">
+                        <div className="panel-head">
+                            <h2>Read-only Queries</h2>
+                            <span className="panel-tag">simulated</span>
+                        </div>
+                        <div className="grid-2">
+                            <Field label="Survey ID" name="querySurveyId" value={form.querySurveyId} onChange={setField} />
+                            <Field label="Respondent (optional)" name="queryRespondent" value={form.queryRespondent} onChange={setField} placeholder="Defaults to your wallet" />
+                        </div>
+                        <div className="row wrap">
+                            <ActionBtn id="getSurvey" label="Get Survey" variant="outline" onClick={onGetSurvey} />
+                            <ActionBtn id="list" label="List Surveys" variant="outline" onClick={onListSurveys} />
+                            <ActionBtn id="respCount" label="Response Count" variant="outline" onClick={onResponseCount} />
+                            <ActionBtn id="hasResp" label="Has Responded?" variant="outline" onClick={onHasResponded} />
+                            <ActionBtn id="accepting" label="Accepting Responses?" variant="outline" onClick={onIsAccepting} />
+                            <ActionBtn id="total" label="Total Count" variant="ghost" onClick={onTotalCount} />
+                        </div>
+                    </section>
+                )}
+
+                {/* Output */}
+                <section className={`card output output-${output.kind}`}>
+                    <div className="panel-head">
+                        <h2>Output</h2>
+                        <span className="panel-tag">{output.kind}</span>
+                    </div>
+                    {output.kind === "loading" ? (
+                        <div className="loader">
+                            <span className="loader-dot" />
+                            <span className="loader-dot" />
+                            <span className="loader-dot" />
+                            <span>Awaiting network response…</span>
+                        </div>
+                    ) : (
+                        <pre className="output-pre">
+                            {output.value || "Run an action above. Results, errors, and contract data will appear here."}
+                        </pre>
+                    )}
+                </section>
+
+                <footer className="foot">
+                    <span>Built on Soroban</span>
+                    <span className="mono tiny">{CONTRACT_ID}</span>
+                </footer>
+            </main>
+
+            {toast && (
+                <div className={`toast toast-${toast.kind}`}>
+                    <span className="toast-bar" />
+                    <span>{toast.message}</span>
                 </div>
-                <div className="card-body">
-                    <pre id="output" className={`output-pre status-${status}`}>
-                        {output || "Connect your wallet and create or respond to surveys. Results will appear here."}
-                    </pre>
-                </div>
-            </section>
-        </main>
+            )}
+        </div>
+    );
+}
+
+function Field({ label, name, value, onChange, type = "text", hint, textarea, rows = 2, readOnly, placeholder }) {
+    return (
+        <div className={`field ${readOnly ? "field-ro" : ""}`}>
+            <label>{label}</label>
+            {textarea ? (
+                <textarea name={name} value={value} onChange={onChange} rows={rows} readOnly={readOnly} placeholder={placeholder} />
+            ) : (
+                <input name={name} value={value} onChange={onChange} type={type} readOnly={readOnly} placeholder={placeholder} />
+            )}
+            {hint && <span className="hint">{hint}</span>}
+        </div>
     );
 }
