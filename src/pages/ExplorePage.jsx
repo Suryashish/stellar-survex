@@ -3,13 +3,29 @@ import { truncate } from "../utils/constants.js";
 import StatusPill from "../components/StatusPill.jsx";
 import Stat from "../components/Stat.jsx";
 
-export default function ExplorePage({ ids, surveys, responses, loading, onRefresh, onExpand, onCollapse, onRespond, onManage, onShare, onTip, onLoadResponses, wallet, expanded }) {
+export default function ExplorePage({ ids, surveys, responses, loading, onRefresh, onExpand, onCollapse, onRespond, onManage, onShare, onTip, onLoadResponses, wallet, expanded, visibilityById, viewersById, coAdminsById }) {
+    const visibleIds = ids.filter((id) => {
+        const s = surveys[id];
+        if (!s) return true; // skeleton — keep so layout doesn't pop
+        const isPriv = !!visibilityById?.[id];
+        if (!isPriv) return true;
+        if (!wallet) return false;
+        if (s.creator === wallet.publicKey) return true;
+        if ((coAdminsById?.[id] || []).includes(wallet.publicKey)) return true;
+        if ((viewersById?.[id] || []).includes(wallet.publicKey)) return true;
+        return false;
+    });
+    const hiddenCount = ids.length - visibleIds.length;
+
     return (
         <div className="explore">
             <div className="explore-head">
                 <div>
                     <h2>All Surveys</h2>
-                    <p>Click any survey to expand. Tap Share to copy a public link.</p>
+                    <p>
+                        Click any survey to expand. Tap Share to copy a public link.
+                        {hiddenCount > 0 && <> · <span className="hint">{hiddenCount} private survey{hiddenCount === 1 ? "" : "s"} hidden</span></>}
+                    </p>
                 </div>
                 <button type="button" className="btn btn-outline btn-sm" onClick={onRefresh} disabled={loading}>
                     {loading ? "Loading…" : "Refresh"}
@@ -36,11 +52,14 @@ export default function ExplorePage({ ids, surveys, responses, loading, onRefres
             )}
 
             <div className="survey-grid">
-                {ids.map((id) => {
+                {visibleIds.map((id) => {
                     const s = surveys[id];
                     const isExpanded = expanded === id;
                     const list = responses[id];
                     const isCreator = wallet && s && s.creator === wallet.publicKey;
+                    const isCoAdminHere = wallet && s && (coAdminsById?.[id] || []).includes(wallet.publicKey);
+                    const canManage = isCreator || isCoAdminHere;
+                    const isPriv = !!visibilityById?.[id];
 
                     return (
                         <article key={id} className={`survey-card ${isExpanded ? "is-selected" : ""}`}>
@@ -50,6 +69,7 @@ export default function ExplorePage({ ids, surveys, responses, loading, onRefres
                                         <div className="survey-id">
                                             <span className="survey-id-tag">{id}</span>
                                             <StatusPill status={s.status} />
+                                            {isPriv && <span className="role-tag role-private">Private</span>}
                                         </div>
                                         <button type="button" className="icon-btn" title="Share" onClick={() => onShare(id)}>↗</button>
                                     </header>
@@ -65,7 +85,7 @@ export default function ExplorePage({ ids, surveys, responses, loading, onRefres
 
                                     <div className="survey-actions">
                                         <button type="button" className="btn btn-sm btn-primary" onClick={() => onRespond(id)}>Respond</button>
-                                        {isCreator && (
+                                        {canManage && (
                                             <button type="button" className="btn btn-sm btn-outline" onClick={() => onManage(id)}>Manage</button>
                                         )}
                                         <button

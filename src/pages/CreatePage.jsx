@@ -53,6 +53,48 @@ export default function CreatePage({ form, wallet, onTitleBlur, onChange, onSetQ
                 <Field label="Creator" value={wallet ? wallet.publicKey : "Connect wallet to auto-fill"} readOnly />
             </div>
 
+            <div className="visibility-card">
+                <div className="visibility-head">
+                    <span className="visibility-label">Visibility</span>
+                    <span className="hint">Controls who can see and respond to this survey.</span>
+                </div>
+                <div className="visibility-options">
+                    <label className={`visibility-option ${form.visibility === "public" ? "is-active" : ""}`}>
+                        <input
+                            type="radio"
+                            name="visibility"
+                            value="public"
+                            checked={form.visibility === "public"}
+                            onChange={onChange}
+                        />
+                        <span className="visibility-option-title">Public</span>
+                        <span className="visibility-option-desc">Anyone with the link can view and respond.</span>
+                    </label>
+                    <label className={`visibility-option ${form.visibility === "private" ? "is-active" : ""}`}>
+                        <input
+                            type="radio"
+                            name="visibility"
+                            value="private"
+                            checked={form.visibility === "private"}
+                            onChange={onChange}
+                        />
+                        <span className="visibility-option-title">Private</span>
+                        <span className="visibility-option-desc">Only wallets you allow can see or answer it.</span>
+                    </label>
+                </div>
+                {form.visibility === "private" && (
+                    <Field
+                        label="Initial allowed wallets (optional)"
+                        name="initialViewers"
+                        textarea
+                        rows={3}
+                        value={form.initialViewers}
+                        onChange={onChange}
+                        hint="Comma or newline separated G… addresses. You can edit this list anytime from the Manage page."
+                    />
+                )}
+            </div>
+
             <div className={`escrow-card ${escrowError ? "escrow-bad" : totalEscrow > 0 ? "escrow-on" : "escrow-off"}`}>
                 <div className="escrow-line">
                     <span className="escrow-label">Total to escrow on publish</span>

@@ -62,4 +62,15 @@ export const emptyCreateForm = () => ({
     endTimeLocal: unixToLocalInput(weekFromNow()),
     maxResponses: "0",
     rewardXlm: "0",
+    visibility: "public",
+    initialViewers: "",
 });
+
+export const isValidStellarAddress = (addr) =>
+    typeof addr === "string" && /^G[A-Z2-7]{55}$/.test(addr.trim());
+
+export const parseAddressList = (raw) =>
+    String(raw || "")
+        .split(/[\s,]+/)
+        .map((v) => v.trim())
+        .filter(Boolean);

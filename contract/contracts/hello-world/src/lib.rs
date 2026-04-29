@@ -54,6 +54,12 @@ pub enum DataKey {
     Responses(Symbol),
     Whitelist(Symbol),
     WhitelistEnabled(Symbol),
+    // New: shared admin access (co-admins) per survey.
+    CoAdmins(Symbol),
+    // New: visibility flag. true = Private, absent/false = Public.
+    Private(Symbol),
+    // New: addresses allowed to see/respond to a private survey.
+    AllowedViewers(Symbol),
 }
 
 // --- Errors ---
@@ -75,6 +81,7 @@ pub enum ContractError {
     InvalidReward     = 11,
     InvalidQuestions  = 12,
     CannotWithdraw    = 13,
+    NotAllowedViewer  = 14,
 }
 
 // --- Contract ---
@@ -109,10 +116,74 @@ impl SurveyBuilderContract {
         env.storage().instance().set(&DataKey::IdList, ids);
     }
 
+    fn load_co_admins(env: &Env, id: &Symbol) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CoAdmins(id.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn save_co_admins(env: &Env, id: &Symbol, list: &Vec<Address>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::CoAdmins(id.clone()), list);
+    }
+
+    fn load_viewers(env: &Env, id: &Symbol) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedViewers(id.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn save_viewers(env: &Env, id: &Symbol, list: &Vec<Address>) {
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedViewers(id.clone()), list);
+    }
+
+    fn is_private_internal(env: &Env, id: &Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Private(id.clone()))
+            .unwrap_or(false)
+    }
+
+    fn is_co_admin_internal(env: &Env, id: &Symbol, addr: &Address) -> bool {
+        let list = Self::load_co_admins(env, id);
+        list.iter().any(|a| &a == addr)
+    }
+
     fn assert_creator(env: &Env, survey: &Survey, caller: &Address) {
         if &survey.creator != caller {
             panic_with_error!(env, ContractError::NotAuthorized);
         }
+    }
+
+    /// Authorise either the original creator OR a registered co-admin.
+    fn assert_admin_or_co_admin(env: &Env, survey: &Survey, caller: &Address) {
+        if &survey.creator == caller {
+            return;
+        }
+        if Self::is_co_admin_internal(env, &survey.id, caller) {
+            return;
+        }
+        panic_with_error!(env, ContractError::NotAuthorized);
+    }
+
+    fn can_view_internal(env: &Env, id: &Symbol, addr: &Address) -> bool {
+        if !Self::is_private_internal(env, id) {
+            return true;
+        }
+        let survey = Self::load_survey(env, id);
+        if &survey.creator == addr {
+            return true;
+        }
+        if Self::is_co_admin_internal(env, id, addr) {
+            return true;
+        }
+        let viewers = Self::load_viewers(env, id);
+        viewers.iter().any(|a| &a == addr)
     }
 
     // -- Survey lifecycle --
@@ -203,10 +274,10 @@ impl SurveyBuilderContract {
             .set(&DataKey::TotalCount, &(count + 1));
     }
 
-    pub fn pause_survey(env: Env, id: Symbol, creator: Address) {
-        creator.require_auth();
+    pub fn pause_survey(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&env, &survey, &creator);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
 
         if survey.status != SurveyStatus::Active {
             panic_with_error!(&env, ContractError::SurveyNotActive);
@@ -216,10 +287,10 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    pub fn resume_survey(env: Env, id: Symbol, creator: Address) {
-        creator.require_auth();
+    pub fn resume_survey(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&env, &survey, &creator);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
 
         if survey.status != SurveyStatus::Paused {
             panic_with_error!(&env, ContractError::SurveyNotActive);
@@ -229,19 +300,19 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    pub fn close_survey(env: Env, id: Symbol, creator: Address) {
-        creator.require_auth();
+    pub fn close_survey(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&env, &survey, &creator);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
 
         survey.status = SurveyStatus::Closed;
         Self::save_survey(&env, &survey);
     }
 
-    pub fn extend_survey(env: Env, id: Symbol, creator: Address, new_end_time: u64) {
-        creator.require_auth();
+    pub fn extend_survey(env: Env, id: Symbol, caller: Address, new_end_time: u64) {
+        caller.require_auth();
         let mut survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&env, &survey, &creator);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
 
         if survey.status == SurveyStatus::Closed {
             panic_with_error!(&env, ContractError::SurveyNotActive);
@@ -255,7 +326,7 @@ impl SurveyBuilderContract {
     }
 
     /// Withdraw any unused escrowed funds back to the creator.
-    /// Allowed when the survey is closed OR has passed its end time.
+    /// Only the original creator can withdraw — co-admins cannot pull funds.
     pub fn withdraw_unused_funds(env: Env, id: Symbol, creator: Address) {
         creator.require_auth();
         let mut survey = Self::load_survey(&env, &id);
@@ -279,21 +350,21 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    // -- Whitelist --
+    // -- Response whitelist (gates who may submit) --
 
-    pub fn enable_whitelist(env: Env, id: Symbol, creator: Address) {
-        creator.require_auth();
+    pub fn enable_whitelist(env: Env, id: Symbol, caller: Address) {
+        caller.require_auth();
         let survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&env, &survey, &creator);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
         env.storage()
             .instance()
             .set(&DataKey::WhitelistEnabled(id), &true);
     }
 
-    pub fn add_to_whitelist(env: Env, id: Symbol, creator: Address, addresses: Vec<Address>) {
-        creator.require_auth();
+    pub fn add_to_whitelist(env: Env, id: Symbol, caller: Address, addresses: Vec<Address>) {
+        caller.require_auth();
         let survey = Self::load_survey(&env, &id);
-        Self::assert_creator(&env, &survey, &creator);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
 
         let wl_key = DataKey::Whitelist(id);
         let mut wl: Vec<Address> = env
@@ -306,6 +377,84 @@ impl SurveyBuilderContract {
             wl.push_back(addr);
         }
         env.storage().instance().set(&wl_key, &wl);
+    }
+
+    // -- Co-admin management (only the original creator can mutate) --
+
+    pub fn add_co_admin(env: Env, id: Symbol, creator: Address, addr: Address) {
+        creator.require_auth();
+        let survey = Self::load_survey(&env, &id);
+        Self::assert_creator(&env, &survey, &creator);
+
+        // No-op when already co-admin or when adding the creator themselves.
+        if addr == survey.creator {
+            return;
+        }
+        let mut list = Self::load_co_admins(&env, &id);
+        if list.iter().any(|a| a == addr) {
+            return;
+        }
+        list.push_back(addr);
+        Self::save_co_admins(&env, &id, &list);
+    }
+
+    pub fn remove_co_admin(env: Env, id: Symbol, creator: Address, addr: Address) {
+        creator.require_auth();
+        let survey = Self::load_survey(&env, &id);
+        Self::assert_creator(&env, &survey, &creator);
+
+        let list = Self::load_co_admins(&env, &id);
+        let mut next: Vec<Address> = Vec::new(&env);
+        for existing in list.iter() {
+            if existing != addr {
+                next.push_back(existing);
+            }
+        }
+        Self::save_co_admins(&env, &id, &next);
+    }
+
+    // -- Visibility & viewer list (admin or co-admin can mutate) --
+
+    /// Set survey visibility. `is_private = true` makes the survey only
+    /// viewable/answerable by the creator, co-admins, and addresses in
+    /// the allowed-viewers list.
+    pub fn set_visibility(env: Env, id: Symbol, caller: Address, is_private: bool) {
+        caller.require_auth();
+        let survey = Self::load_survey(&env, &id);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::Private(id), &is_private);
+    }
+
+    pub fn add_allowed_viewers(env: Env, id: Symbol, caller: Address, addresses: Vec<Address>) {
+        caller.require_auth();
+        let survey = Self::load_survey(&env, &id);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
+
+        let mut list = Self::load_viewers(&env, &id);
+        for addr in addresses.iter() {
+            if list.iter().any(|a| a == addr) {
+                continue;
+            }
+            list.push_back(addr);
+        }
+        Self::save_viewers(&env, &id, &list);
+    }
+
+    pub fn remove_allowed_viewer(env: Env, id: Symbol, caller: Address, addr: Address) {
+        caller.require_auth();
+        let survey = Self::load_survey(&env, &id);
+        Self::assert_admin_or_co_admin(&env, &survey, &caller);
+
+        let list = Self::load_viewers(&env, &id);
+        let mut next: Vec<Address> = Vec::new(&env);
+        for existing in list.iter() {
+            if existing != addr {
+                next.push_back(existing);
+            }
+        }
+        Self::save_viewers(&env, &id, &next);
     }
 
     // -- Response submission --
@@ -339,7 +488,12 @@ impl SurveyBuilderContract {
             panic_with_error!(&env, ContractError::AlreadyResponded);
         }
 
-        // Whitelist
+        // Private-mode access gate (visibility list).
+        if !Self::can_view_internal(&env, &survey_id, &respondent) {
+            panic_with_error!(&env, ContractError::NotAllowedViewer);
+        }
+
+        // Response whitelist (orthogonal to visibility — gates who may submit).
         let wl_enabled: bool = env
             .storage()
             .instance()
@@ -450,5 +604,27 @@ impl SurveyBuilderContract {
             .instance()
             .get(&DataKey::Responses(survey_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    // -- New read queries --
+
+    pub fn get_co_admins(env: Env, id: Symbol) -> Vec<Address> {
+        Self::load_co_admins(&env, &id)
+    }
+
+    pub fn get_allowed_viewers(env: Env, id: Symbol) -> Vec<Address> {
+        Self::load_viewers(&env, &id)
+    }
+
+    pub fn is_private(env: Env, id: Symbol) -> bool {
+        Self::is_private_internal(&env, &id)
+    }
+
+    pub fn is_co_admin(env: Env, id: Symbol, addr: Address) -> bool {
+        Self::is_co_admin_internal(&env, &id, &addr)
+    }
+
+    pub fn can_view(env: Env, id: Symbol, addr: Address) -> bool {
+        Self::can_view_internal(&env, &id, &addr)
     }
 }

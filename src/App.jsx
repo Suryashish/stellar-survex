@@ -21,6 +21,15 @@ import {
     hasResponded,
     isAcceptingResponses,
     getResponses,
+    addCoAdmin,
+    removeCoAdmin,
+    getCoAdmins,
+    setVisibility,
+    addAllowedViewers,
+    removeAllowedViewer,
+    getAllowedViewers,
+    isPrivateSurvey,
+    canView,
     sendPayment,
     xlmToStroops,
     stroopsToXlm,
@@ -31,7 +40,7 @@ import {
 } from "../lib/stellar.js";
 
 import { NAV, nowTs, truncate, newTxId } from "./utils/constants.js";
-import { normalizeSurvey, decodeAnswers, slugifyId, emptyCreateForm } from "./utils/survey.js";
+import { normalizeSurvey, decodeAnswers, slugifyId, emptyCreateForm, isValidStellarAddress, parseAddressList } from "./utils/survey.js";
 
 import TxDrawer from "./components/TxDrawer.jsx";
 import PaymentModal from "./components/PaymentModal.jsx";
@@ -57,6 +66,9 @@ export default function App() {
     const [surveyIds, setSurveyIds] = useState([]);
     const [surveysById, setSurveysById] = useState({});
     const [responsesById, setResponsesById] = useState({});
+    const [coAdminsById, setCoAdminsById] = useState({});
+    const [viewersById, setViewersById] = useState({});
+    const [visibilityById, setVisibilityById] = useState({});
     const [exploreLoading, setExploreLoading] = useState(false);
     const [expandedSurvey, setExpandedSurvey] = useState(null);
 
@@ -70,6 +82,8 @@ export default function App() {
         newEndTimeLocal: "",
         manageRewardXlm: "0",
         whitelistAddrs: "",
+        viewerAddrs: "",
+        newCoAdmin: "",
     });
     const [answers, setAnswers] = useState([]);
 
@@ -87,7 +101,7 @@ export default function App() {
         const params = new URLSearchParams(window.location.search);
         return params.get("survey") || null;
     });
-    const [sharedSurveyState, setSharedSurveyState] = useState({ loading: true, survey: null, hasResponded: null, submitted: false });
+    const [sharedSurveyState, setSharedSurveyState] = useState({ loading: true, survey: null, hasResponded: null, submitted: false, isPrivate: false, canView: null });
 
     useEffect(() => {
         return () => confirmTimer.current && clearTimeout(confirmTimer.current);
@@ -137,22 +151,59 @@ export default function App() {
             const idStrings = (ids || []).map((s) => (typeof s === "string" ? s : String(s)));
             setSurveyIds(idStrings);
 
-            const fetched = {};
+            const fetchedSurveys = {};
+            const fetchedCoAdmins = {};
+            const fetchedViewers = {};
+            const fetchedVisibility = {};
             await Promise.all(idStrings.map(async (id) => {
                 try {
                     const data = await getSurvey(id);
-                    fetched[id] = normalizeSurvey(data);
+                    fetchedSurveys[id] = normalizeSurvey(data);
                 } catch {
-                    fetched[id] = null;
+                    fetchedSurveys[id] = null;
+                }
+                try {
+                    const list = await getCoAdmins(id);
+                    fetchedCoAdmins[id] = (list || []).map((a) => String(a));
+                } catch {
+                    fetchedCoAdmins[id] = [];
+                }
+                try {
+                    const list = await getAllowedViewers(id);
+                    fetchedViewers[id] = (list || []).map((a) => String(a));
+                } catch {
+                    fetchedViewers[id] = [];
+                }
+                try {
+                    const value = await isPrivateSurvey(id);
+                    fetchedVisibility[id] = Boolean(value);
+                } catch {
+                    fetchedVisibility[id] = false;
                 }
             }));
-            setSurveysById(fetched);
+            setSurveysById(fetchedSurveys);
+            setCoAdminsById(fetchedCoAdmins);
+            setViewersById(fetchedViewers);
+            setVisibilityById(fetchedVisibility);
         } catch (error) {
             notifyError("Failed to load surveys", error.message);
         } finally {
             setExploreLoading(false);
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const refreshSurveyMeta = useCallback(async (id) => {
+        if (!id) return;
+        const [coAdminList, viewerList, priv] = await Promise.all([
+            getCoAdmins(id).then((v) => (v || []).map(String)).catch(() => []),
+            getAllowedViewers(id).then((v) => (v || []).map(String)).catch(() => []),
+            isPrivateSurvey(id).then(Boolean).catch(() => false),
+        ]);
+        setCoAdminsById((prev) => ({ ...prev, [id]: coAdminList }));
+        setViewersById((prev) => ({ ...prev, [id]: viewerList }));
+        setVisibilityById((prev) => ({ ...prev, [id]: priv }));
+        return { coAdminList, viewerList, priv };
     }, []);
 
     const refreshResponses = useCallback(async (id) => {
@@ -196,25 +247,29 @@ export default function App() {
         if (!sharedSurveyId) return;
         let cancelled = false;
         (async () => {
-            setSharedSurveyState({ loading: true, survey: null, hasResponded: null, submitted: false });
+            setSharedSurveyState({ loading: true, survey: null, hasResponded: null, submitted: false, isPrivate: false, canView: null });
             try {
-                const raw = await getSurvey(sharedSurveyId);
+                const [raw, priv] = await Promise.all([
+                    getSurvey(sharedSurveyId),
+                    isPrivateSurvey(sharedSurveyId).then(Boolean).catch(() => false),
+                ]);
                 const normalized = normalizeSurvey(raw);
                 if (cancelled) return;
-                setSharedSurveyState({ loading: false, survey: normalized, hasResponded: null, submitted: false });
+                setSharedSurveyState({ loading: false, survey: normalized, hasResponded: null, submitted: false, isPrivate: priv, canView: null });
                 if (normalized) {
                     setSurveysById((prev) => ({ ...prev, [sharedSurveyId]: normalized }));
+                    setVisibilityById((prev) => ({ ...prev, [sharedSurveyId]: priv }));
                     setRespondId(sharedSurveyId);
                     setAnswers(new Array(normalized.questions.length).fill(""));
                 }
             } catch {
-                if (!cancelled) setSharedSurveyState({ loading: false, survey: null, hasResponded: null, submitted: false });
+                if (!cancelled) setSharedSurveyState({ loading: false, survey: null, hasResponded: null, submitted: false, isPrivate: false, canView: null });
             }
         })();
         return () => { cancelled = true; };
     }, [sharedSurveyId]);
 
-    // When wallet connects in shared mode, check if they already responded
+    // When wallet connects in shared mode, check responded + access.
     useEffect(() => {
         if (!sharedSurveyId || !wallet) return;
         let cancelled = false;
@@ -223,6 +278,12 @@ export default function App() {
                 const value = await hasResponded(sharedSurveyId, wallet.publicKey);
                 if (!cancelled) setSharedSurveyState((prev) => ({ ...prev, hasResponded: Boolean(value) }));
             } catch { /* tolerate */ }
+            try {
+                const allowed = await canView(sharedSurveyId, wallet.publicKey);
+                if (!cancelled) setSharedSurveyState((prev) => ({ ...prev, canView: Boolean(allowed) }));
+            } catch {
+                if (!cancelled) setSharedSurveyState((prev) => ({ ...prev, canView: !prev.isPrivate }));
+            }
         })();
         return () => { cancelled = true; };
     }, [sharedSurveyId, wallet]);
@@ -247,6 +308,7 @@ export default function App() {
             if (refresh?.total) await refreshTotal();
             if (refresh?.explore) await refreshExplore();
             if (refresh?.responsesOf) await refreshResponses(refresh.responsesOf);
+            if (refresh?.metaOf) await refreshSurveyMeta(refresh.metaOf);
             return value;
         } catch (error) {
             const message = error?.message || String(error);
@@ -318,16 +380,39 @@ export default function App() {
             return;
         }
 
-        run("create", `Create ${createForm.id}`, () => createSurvey({
-            id: createForm.id.trim(),
-            creator: wallet.publicKey,
-            title: createForm.title.trim(),
-            description: createForm.description.trim(),
-            questions: trimmedQuestions,
-            endTime: endUnix,
-            maxResponses: createForm.maxResponses.trim() || "0",
-            rewardStroops: xlmToStroops(createForm.rewardXlm.trim() || "0"),
-        }), {
+        const surveyId = createForm.id.trim();
+        const isPrivate = createForm.visibility === "private";
+        const initialViewers = isPrivate
+            ? parseAddressList(createForm.initialViewers).filter(isValidStellarAddress)
+            : [];
+
+        run("create", `Create ${surveyId}`, async () => {
+            const result = await createSurvey({
+                id: surveyId,
+                creator: wallet.publicKey,
+                title: createForm.title.trim(),
+                description: createForm.description.trim(),
+                questions: trimmedQuestions,
+                endTime: endUnix,
+                maxResponses: createForm.maxResponses.trim() || "0",
+                rewardStroops: xlmToStroops(createForm.rewardXlm.trim() || "0"),
+            });
+            if (isPrivate) {
+                try {
+                    await setVisibility({ id: surveyId, caller: wallet.publicKey, isPrivate: true });
+                } catch (e) {
+                    notifyError("Set visibility", e?.message || String(e));
+                }
+                if (initialViewers.length) {
+                    try {
+                        await addAllowedViewers({ id: surveyId, caller: wallet.publicKey, addresses: initialViewers });
+                    } catch (e) {
+                        notifyError("Add viewers", e?.message || String(e));
+                    }
+                }
+            }
+            return result;
+        }, {
             onSuccess: () => setCreateForm(emptyCreateForm()),
             refresh: { total: true, explore: true },
         });
@@ -341,9 +426,13 @@ export default function App() {
             newEndTimeLocal: s ? unixToLocalInput(s.end_time) : "",
             manageRewardXlm: s ? stroopsToXlm(s.reward_per_response) : "0",
             whitelistAddrs: "",
+            viewerAddrs: "",
+            newCoAdmin: "",
         });
         if (!responsesById[id]) refreshResponses(id);
-    }, [surveysById, responsesById, refreshResponses]);
+        // Refresh meta (co-admins, viewers, visibility) on selection.
+        refreshSurveyMeta(id);
+    }, [surveysById, responsesById, refreshResponses, refreshSurveyMeta]);
 
     const updateManage = (patch) => setManageForm((prev) => ({ ...prev, ...patch }));
 
@@ -362,20 +451,20 @@ export default function App() {
     const onPause = () => {
         if (!requireWallet() || !manageId) return;
         run("pause", `Pause ${manageId}`, () =>
-            pauseSurvey({ id: manageId, creator: wallet.publicKey }),
+            pauseSurvey({ id: manageId, caller: wallet.publicKey }),
             { refresh: { explore: true } });
     };
     const onResume = () => {
         if (!requireWallet() || !manageId) return;
         run("resume", `Resume ${manageId}`, () =>
-            resumeSurvey({ id: manageId, creator: wallet.publicKey }),
+            resumeSurvey({ id: manageId, caller: wallet.publicKey }),
             { refresh: { explore: true } });
     };
     const onClose = () => {
         if (!requireWallet() || !manageId) return;
         handleConfirm("close", () =>
             run("close", `Close ${manageId}`, () =>
-                closeSurvey({ id: manageId, creator: wallet.publicKey }),
+                closeSurvey({ id: manageId, caller: wallet.publicKey }),
                 { refresh: { explore: true } }));
     };
     const onExtend = () => {
@@ -384,7 +473,7 @@ export default function App() {
         if (!unix) { notifyError("Pick a new end time", "Choose a future date and time."); return; }
         run("extend", `Extend ${manageId}`, () => extendSurvey({
             id: manageId,
-            creator: wallet.publicKey,
+            caller: wallet.publicKey,
             newEndTime: unix,
         }), { refresh: { explore: true } });
     };
@@ -397,22 +486,99 @@ export default function App() {
     const onEnableWhitelist = () => {
         if (!requireWallet() || !manageId) return;
         run("enable_wl", `Enable whitelist ${manageId}`, () =>
-            enableWhitelist({ id: manageId, creator: wallet.publicKey }));
+            enableWhitelist({ id: manageId, caller: wallet.publicKey }));
     };
     const onAddWhitelist = () => {
         if (!requireWallet() || !manageId) return;
-        const addresses = manageForm.whitelistAddrs.split(/[\s,]+/).map((v) => v.trim()).filter(Boolean);
+        const addresses = parseAddressList(manageForm.whitelistAddrs);
         if (!addresses.length) {
             notifyError("Whitelist", "Enter at least one address.");
             return;
         }
+        const invalid = addresses.find((a) => !isValidStellarAddress(a));
+        if (invalid) {
+            notifyError("Whitelist", `Not a valid Stellar address: ${invalid}`);
+            return;
+        }
         run("add_wl", `Whitelist +${addresses.length}`, () => addToWhitelist({
             id: manageId,
-            creator: wallet.publicKey,
+            caller: wallet.publicKey,
             addresses,
         }), {
             onSuccess: () => updateManage({ whitelistAddrs: "" }),
         });
+    };
+
+    // ---- co-admin management ----
+    const onAddCoAdmin = () => {
+        if (!requireWallet() || !manageId) return;
+        const addr = String(manageForm.newCoAdmin || "").trim();
+        if (!isValidStellarAddress(addr)) {
+            notifyError("Co-admin", "Enter a valid G… Stellar address.");
+            return;
+        }
+        if (addr === wallet.publicKey) {
+            notifyError("Co-admin", "You're already the admin.");
+            return;
+        }
+        run("add_coadmin", `Add co-admin ${truncate(addr)}`, () => addCoAdmin({
+            id: manageId,
+            creator: wallet.publicKey,
+            address: addr,
+        }), {
+            onSuccess: () => updateManage({ newCoAdmin: "" }),
+            refresh: { metaOf: manageId },
+        });
+    };
+
+    const onRemoveCoAdmin = (addr) => {
+        if (!requireWallet() || !manageId) return;
+        run("remove_coadmin", `Remove co-admin ${truncate(addr)}`, () => removeCoAdmin({
+            id: manageId,
+            creator: wallet.publicKey,
+            address: addr,
+        }), { refresh: { metaOf: manageId } });
+    };
+
+    // ---- visibility & viewers ----
+    const onSetVisibility = (isPrivate) => {
+        if (!requireWallet() || !manageId) return;
+        run("set_vis", `${isPrivate ? "Private" : "Public"} ${manageId}`, () => setVisibility({
+            id: manageId,
+            caller: wallet.publicKey,
+            isPrivate,
+        }), { refresh: { metaOf: manageId } });
+    };
+
+    const onAddViewers = () => {
+        if (!requireWallet() || !manageId) return;
+        const addresses = parseAddressList(manageForm.viewerAddrs);
+        if (!addresses.length) {
+            notifyError("Viewers", "Enter at least one address.");
+            return;
+        }
+        const invalid = addresses.find((a) => !isValidStellarAddress(a));
+        if (invalid) {
+            notifyError("Viewers", `Not a valid Stellar address: ${invalid}`);
+            return;
+        }
+        run("add_viewers", `Allow +${addresses.length}`, () => addAllowedViewers({
+            id: manageId,
+            caller: wallet.publicKey,
+            addresses,
+        }), {
+            onSuccess: () => updateManage({ viewerAddrs: "" }),
+            refresh: { metaOf: manageId },
+        });
+    };
+
+    const onRemoveViewer = (addr) => {
+        if (!requireWallet() || !manageId) return;
+        run("remove_viewer", `Revoke ${truncate(addr)}`, () => removeAllowedViewer({
+            id: manageId,
+            caller: wallet.publicKey,
+            address: addr,
+        }), { refresh: { metaOf: manageId } });
     };
 
     // ---- respond ----
@@ -554,8 +720,13 @@ export default function App() {
         if (!wallet) return [];
         return sortedSurveyIds
             .map((id) => surveysById[id])
-            .filter((s) => s && s.creator === wallet.publicKey);
-    }, [wallet, sortedSurveyIds, surveysById]);
+            .filter((s) => {
+                if (!s) return false;
+                if (s.creator === wallet.publicKey) return true;
+                const co = coAdminsById[s.id] || [];
+                return co.includes(wallet.publicKey);
+            });
+    }, [wallet, sortedSurveyIds, surveysById, coAdminsById]);
 
     const isBusy = busyAction != null;
 
@@ -705,6 +876,9 @@ export default function App() {
                             }
                             wallet={wallet}
                             expanded={expandedSurvey}
+                            visibilityById={visibilityById}
+                            viewersById={viewersById}
+                            coAdminsById={coAdminsById}
                         />
                     )}
 
@@ -743,6 +917,14 @@ export default function App() {
                             onShare={shareSurvey}
                             onTip={(addr, sid) => openPayment(addr, { surveyId: sid })}
                             onReloadResponses={() => refreshResponses(manageId)}
+                            coAdmins={coAdminsById[manageId]}
+                            viewers={viewersById[manageId]}
+                            isPrivate={visibilityById[manageId] || false}
+                            onAddCoAdmin={onAddCoAdmin}
+                            onRemoveCoAdmin={onRemoveCoAdmin}
+                            onSetVisibility={onSetVisibility}
+                            onAddViewers={onAddViewers}
+                            onRemoveViewer={onRemoveViewer}
                             busyAction={busyAction}
                             confirmKey={confirmKey}
                             disabled={isBusy}

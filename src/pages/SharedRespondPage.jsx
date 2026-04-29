@@ -4,7 +4,7 @@ import { nowTs } from "../utils/constants.js";
 import Stat from "../components/Stat.jsx";
 
 export default function SharedRespondPage({ state, surveyId, wallet, answers, onSetAnswer, onConnect, onDisconnect, onSubmit, onExit, connecting, submitting, disabled }) {
-    const { loading, survey, hasResponded: alreadyResponded, submitted } = state;
+    const { loading, survey, hasResponded: alreadyResponded, submitted, isPrivate, canView } = state;
     const flags = useMemo(() => {
         if (!survey) return { expired: false, closed: false, full: false, blocking: false };
         const expired = survey.end_time < nowTs();
@@ -13,7 +13,10 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
         return { expired, closed, full, blocking: expired || closed || full };
     }, [survey]);
     const { expired, closed, full, blocking } = flags;
-    const canRespond = wallet && !alreadyResponded && !blocking && !submitted;
+    // Private surveys: viewer must be on the allowed list (or be admin / co-admin).
+    const accessDenied = !!(survey && isPrivate && wallet && canView === false);
+    const accessUnknown = !!(survey && isPrivate && wallet && canView == null);
+    const canRespond = wallet && !alreadyResponded && !blocking && !submitted && !accessDenied && !accessUnknown;
 
     return (
         <div className="shared-page">
@@ -73,7 +76,10 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
 
                 {survey && (
                     <article className="shared-card">
-                        <span className="shared-tag">SURVEY · {survey.id}</span>
+                        <span className="shared-tag">
+                            SURVEY · {survey.id}
+                            {isPrivate && <span className="role-tag role-private" style={{ marginLeft: ".5rem" }}>Private</span>}
+                        </span>
                         <h1 className="shared-title">{survey.title}</h1>
                         {survey.description && <p className="shared-desc">{survey.description}</p>}
 
@@ -125,7 +131,30 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
                             </div>
                         )}
 
-                        {!submitted && !blocking && wallet && alreadyResponded && (
+                        {!submitted && !blocking && accessDenied && (
+                            <div className="shared-blocking">
+                                <span className="shared-blocking-icon">🔒</span>
+                                <h2>This survey is private</h2>
+                                <p>
+                                    Your wallet ({wallet.publicKey.slice(0, 6)}…{wallet.publicKey.slice(-4)}) isn't on the
+                                    allowed list. Ask the survey admin to add you, then refresh.
+                                </p>
+                                <button type="button" className="btn btn-outline" onClick={onExit}>Browse other surveys</button>
+                            </div>
+                        )}
+
+                        {!submitted && !blocking && accessUnknown && (
+                            <div className="shared-cta">
+                                <div className="loader-row">
+                                    <span className="loader-dot" />
+                                    <span className="loader-dot" />
+                                    <span className="loader-dot" />
+                                </div>
+                                <p className="hint">Checking access for your wallet…</p>
+                            </div>
+                        )}
+
+                        {!submitted && !blocking && !accessDenied && !accessUnknown && wallet && alreadyResponded && (
                             <div className="shared-already">
                                 <span className="shared-success-icon">✓</span>
                                 <h2>You've already responded</h2>
