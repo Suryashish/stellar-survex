@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype,
-    panic_with_error, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error,
+    token, Address, Env, String, Symbol, Vec,
 };
 
 // --- Data Structures ---
@@ -20,9 +20,12 @@ pub struct Survey {
     pub created_at: u64,
     pub end_time: u64,
     pub max_responses: u32,
-    /// Informational reward per response in stroops (1 XLM = 10_000_000).
-    /// Payment is settled off-contract via direct payment from the creator.
+    /// Reward per response in token base units (stroops for native XLM).
     pub reward_per_response: i128,
+    /// Token contract address used to pay rewards (e.g. native XLM SAC).
+    pub reward_token: Address,
+    /// Remaining escrowed funds inside this contract for this survey.
+    pub funded_remaining: i128,
 }
 
 #[contracttype]
@@ -47,9 +50,7 @@ pub enum DataKey {
     IdList,
     TotalCount,
     Survey(Symbol),
-    /// Dedup flag — exists if the address has already responded.
     Response(Symbol, Address),
-    /// Ordered list of full response entries for retrieval.
     Responses(Symbol),
     Whitelist(Symbol),
     WhitelistEnabled(Symbol),
@@ -73,6 +74,7 @@ pub enum ContractError {
     AlreadyExists     = 10,
     InvalidReward     = 11,
     InvalidQuestions  = 12,
+    CannotWithdraw    = 13,
 }
 
 // --- Contract ---
@@ -125,6 +127,7 @@ impl SurveyBuilderContract {
         end_time: u64,
         max_responses: u32,
         reward_per_response: i128,
+        reward_token: Address,
     ) {
         creator.require_auth();
 
@@ -137,6 +140,10 @@ impl SurveyBuilderContract {
         if reward_per_response < 0 {
             panic_with_error!(&env, ContractError::InvalidReward);
         }
+        // Need a known cap to escrow rewards.
+        if reward_per_response > 0 && max_responses == 0 {
+            panic_with_error!(&env, ContractError::InvalidReward);
+        }
 
         let now = env.ledger().timestamp();
         if end_time <= now {
@@ -146,6 +153,18 @@ impl SurveyBuilderContract {
         let key = DataKey::Survey(id.clone());
         if env.storage().instance().has(&key) {
             panic_with_error!(&env, ContractError::AlreadyExists);
+        }
+
+        // Escrow upfront: total = reward_per_response * max_responses.
+        let total: i128 = if reward_per_response > 0 {
+            reward_per_response * (max_responses as i128)
+        } else {
+            0
+        };
+
+        if total > 0 {
+            let client = token::Client::new(&env, &reward_token);
+            client.transfer(&creator, &env.current_contract_address(), &total);
         }
 
         let survey = Survey {
@@ -160,6 +179,8 @@ impl SurveyBuilderContract {
             end_time,
             max_responses,
             reward_per_response,
+            reward_token,
+            funded_remaining: total,
         };
 
         env.storage().instance().set(&key, &survey);
@@ -233,15 +254,28 @@ impl SurveyBuilderContract {
         Self::save_survey(&env, &survey);
     }
 
-    pub fn update_reward(env: Env, id: Symbol, creator: Address, reward_per_response: i128) {
+    /// Withdraw any unused escrowed funds back to the creator.
+    /// Allowed when the survey is closed OR has passed its end time.
+    pub fn withdraw_unused_funds(env: Env, id: Symbol, creator: Address) {
         creator.require_auth();
         let mut survey = Self::load_survey(&env, &id);
         Self::assert_creator(&env, &survey, &creator);
 
-        if reward_per_response < 0 {
-            panic_with_error!(&env, ContractError::InvalidReward);
+        if survey.funded_remaining <= 0 {
+            return;
         }
-        survey.reward_per_response = reward_per_response;
+
+        let now = env.ledger().timestamp();
+        let terminated = survey.status == SurveyStatus::Closed || now > survey.end_time;
+        if !terminated {
+            panic_with_error!(&env, ContractError::CannotWithdraw);
+        }
+
+        let amount = survey.funded_remaining;
+        let client = token::Client::new(&env, &survey.reward_token);
+        client.transfer(&env.current_contract_address(), &creator, &amount);
+
+        survey.funded_remaining = 0;
         Self::save_survey(&env, &survey);
     }
 
@@ -299,11 +333,13 @@ impl SurveyBuilderContract {
             panic_with_error!(&env, ContractError::ResponseLimitHit);
         }
 
+        // Wallet-level dedup
         let resp_key = DataKey::Response(survey_id.clone(), respondent.clone());
         if env.storage().instance().has(&resp_key) {
             panic_with_error!(&env, ContractError::AlreadyResponded);
         }
 
+        // Whitelist
         let wl_enabled: bool = env
             .storage()
             .instance()
@@ -334,11 +370,22 @@ impl SurveyBuilderContract {
             .unwrap_or(Vec::new(&env));
 
         entries.push_back(ResponseEntry {
-            respondent,
+            respondent: respondent.clone(),
             answers,
             submitted_at: now,
         });
         env.storage().instance().set(&entries_key, &entries);
+
+        // Auto-payout from escrow
+        if survey.reward_per_response > 0 && survey.funded_remaining >= survey.reward_per_response {
+            let client = token::Client::new(&env, &survey.reward_token);
+            client.transfer(
+                &env.current_contract_address(),
+                &respondent,
+                &survey.reward_per_response,
+            );
+            survey.funded_remaining -= survey.reward_per_response;
+        }
 
         if survey.max_responses > 0 && survey.response_count >= survey.max_responses {
             survey.status = SurveyStatus::Closed;
