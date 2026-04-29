@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
 import "./App.css";
 import {
     checkConnection,
@@ -17,28 +18,25 @@ import {
     getSurvey,
     listSurveys,
     getTotalCount,
-    getResponseCount,
     hasResponded,
     isAcceptingResponses,
-    getParticipants,
+    getResponses,
     sendPayment,
     xlmToStroops,
     stroopsToXlm,
+    unixToLocalInput,
+    localInputToUnix,
+    formatUnix,
+    formatRelative,
     CONTRACT_ID,
     NETWORK_NAME,
 } from "../lib/stellar.js";
 
 const nowTs = () => Math.floor(Date.now() / 1000);
-const dayFromNow = () => nowTs() + 86400;
+const weekFromNow = () => nowTs() + 7 * 86400;
 
 const truncate = (addr, head = 6, tail = 4) =>
     !addr || addr.length < head + tail + 3 ? addr || "" : `${addr.slice(0, head)}…${addr.slice(-tail)}`;
-
-const formatTime = (ts) => {
-    const n = Number(ts);
-    if (!n) return "—";
-    return new Date(n * 1000).toLocaleString();
-};
 
 const statusLabel = (status) => {
     if (status == null) return "Unknown";
@@ -49,12 +47,14 @@ const statusLabel = (status) => {
 
 const normalizeSurvey = (raw) => {
     if (!raw) return null;
+    const questions = Array.isArray(raw.questions) ? raw.questions.map((q) => String(q)) : [];
     return {
         id: typeof raw.id === "string" ? raw.id : String(raw.id),
         creator: raw.creator,
         title: raw.title,
         description: raw.description,
-        question_count: Number(raw.question_count),
+        questions,
+        question_count: questions.length,
         response_count: Number(raw.response_count),
         max_responses: Number(raw.max_responses),
         status: statusLabel(raw.status),
@@ -64,6 +64,17 @@ const normalizeSurvey = (raw) => {
             ? raw.reward_per_response
             : BigInt(raw.reward_per_response || 0),
     };
+};
+
+const decodeAnswers = (str) => {
+    if (!str) return [];
+    try {
+        const parsed = JSON.parse(str);
+        if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+        return [String(str)];
+    } catch {
+        return [String(str)];
+    }
 };
 
 const NAV = [
@@ -76,6 +87,26 @@ const NAV = [
 
 const newTxId = () => `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
+const slugifyId = (text) => {
+    const base = String(text || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 32);
+    return base || `s_${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const emptyCreateForm = () => ({
+    id: `survey_${Math.random().toString(36).slice(2, 6)}`,
+    title: "",
+    description: "",
+    questions: ["", ""],
+    endTimeLocal: unixToLocalInput(weekFromNow()),
+    maxResponses: "0",
+    rewardXlm: "0",
+});
+
 export default function App() {
     const [wallet, setWallet] = useState(null);
     const [network, setNetwork] = useState("");
@@ -87,46 +118,46 @@ export default function App() {
     const [confirmKey, setConfirmKey] = useState(null);
     const confirmTimer = useRef(null);
 
-    // Explore data
+    // Surveys data
     const [surveyIds, setSurveyIds] = useState([]);
     const [surveysById, setSurveysById] = useState({});
-    const [participantsById, setParticipantsById] = useState({});
+    const [responsesById, setResponsesById] = useState({});
     const [exploreLoading, setExploreLoading] = useState(false);
-    const [selectedSurvey, setSelectedSurvey] = useState(null);
+    const [expandedSurvey, setExpandedSurvey] = useState(null);
 
-    // Payment modal
-    const [paymentModal, setPaymentModal] = useState(null); // { recipient, surveyId? }
+    // Selections
+    const [manageId, setManageId] = useState("");
+    const [respondId, setRespondId] = useState("");
 
     // Forms
-    const [form, setForm] = useState({
-        id: "survey1",
-        title: "Developer Satisfaction Survey",
-        description: "Rate your experience with Soroban",
-        questionCount: "5",
-        endTime: String(dayFromNow()),
-        maxResponses: "0",
-        rewardXlm: "0",
-        manageId: "survey1",
-        newEndTime: String(dayFromNow() + 86400),
-        whitelistAddrs: "",
+    const [createForm, setCreateForm] = useState(emptyCreateForm());
+    const [manageForm, setManageForm] = useState({
+        newEndTimeLocal: "",
         manageRewardXlm: "0",
-        respondId: "survey1",
-        answers: "5,4,3,5,4",
-        querySurveyId: "survey1",
-        queryRespondent: "",
+        whitelistAddrs: "",
     });
+    const [answers, setAnswers] = useState([]);
 
-    const setField = (event) => {
-        const { name, value } = event.target;
-        setForm((prev) => ({ ...prev, [name]: value }));
-    };
-    const patchForm = (patch) => setForm((prev) => ({ ...prev, ...patch }));
+    const [paymentModal, setPaymentModal] = useState(null);
+
+    // Analytics
+    const [analyticsId, setAnalyticsId] = useState("");
+    const [analyticsScope, setAnalyticsScope] = useState("mine"); // "mine" | "all"
+    const [analyticsCheck, setAnalyticsCheck] = useState({ accepting: null, hasResponded: null, respondent: "" });
+    const [analyticsLoading, setAnalyticsLoading] = useState(false);
+
+    // Shared landing (URL ?survey=<id>)
+    const [sharedSurveyId, setSharedSurveyId] = useState(() => {
+        if (typeof window === "undefined") return null;
+        const params = new URLSearchParams(window.location.search);
+        return params.get("survey") || null;
+    });
+    const [sharedSurveyState, setSharedSurveyState] = useState({ loading: true, survey: null, hasResponded: null, submitted: false });
 
     useEffect(() => {
         return () => confirmTimer.current && clearTimeout(confirmTimer.current);
     }, []);
 
-    // ---- Transaction feed ----
     const addTx = useCallback((label) => {
         const id = newTxId();
         setTransactions((prev) => [
@@ -147,7 +178,6 @@ export default function App() {
 
     const dismissTx = (id) => setTransactions((prev) => prev.filter((t) => t.id !== id));
 
-    // ---- Refresh helpers ----
     const refreshTotal = useCallback(async () => {
         try {
             const value = await getTotalCount();
@@ -181,18 +211,24 @@ export default function App() {
         }
     }, []);
 
-    const refreshParticipants = useCallback(async (id) => {
+    const refreshResponses = useCallback(async (id) => {
         try {
-            const list = await getParticipants(id);
-            setParticipantsById((prev) => ({ ...prev, [id]: list || [] }));
-            return list;
+            const list = await getResponses(id);
+            const normalized = (list || []).map((entry) => ({
+                respondent: entry.respondent,
+                answers: decodeAnswers(entry.answers),
+                rawAnswers: entry.answers,
+                submitted_at: Number(entry.submitted_at || 0),
+            }));
+            setResponsesById((prev) => ({ ...prev, [id]: normalized }));
+            return normalized;
         } catch {
-            setParticipantsById((prev) => ({ ...prev, [id]: [] }));
+            setResponsesById((prev) => ({ ...prev, [id]: [] }));
             return [];
         }
     }, []);
 
-    // ---- Initial mount ----
+    // ---- mount ----
     useEffect(() => {
         (async () => {
             try {
@@ -203,20 +239,60 @@ export default function App() {
                     setNetwork(net);
                 }
             } catch { /* noop */ }
-            refreshTotal();
-            refreshExplore();
+            if (!sharedSurveyId) {
+                refreshTotal();
+                refreshExplore();
+            }
         })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
-        // URL deep link: ?survey=<id> opens Respond pre-filled
-        const params = new URLSearchParams(window.location.search);
-        const sharedId = params.get("survey");
-        if (sharedId) {
-            patchForm({ respondId: sharedId, querySurveyId: sharedId, manageId: sharedId });
-            setActiveNav("respond");
+    // Shared survey loader
+    useEffect(() => {
+        if (!sharedSurveyId) return;
+        let cancelled = false;
+        (async () => {
+            setSharedSurveyState({ loading: true, survey: null, hasResponded: null, submitted: false });
+            try {
+                const raw = await getSurvey(sharedSurveyId);
+                const normalized = normalizeSurvey(raw);
+                if (cancelled) return;
+                setSharedSurveyState({ loading: false, survey: normalized, hasResponded: null, submitted: false });
+                if (normalized) {
+                    setSurveysById((prev) => ({ ...prev, [sharedSurveyId]: normalized }));
+                    setRespondId(sharedSurveyId);
+                    setAnswers(new Array(normalized.questions.length).fill(""));
+                }
+            } catch {
+                if (!cancelled) setSharedSurveyState({ loading: false, survey: null, hasResponded: null, submitted: false });
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [sharedSurveyId]);
+
+    // When wallet connects in shared mode, check if they already responded
+    useEffect(() => {
+        if (!sharedSurveyId || !wallet) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const value = await hasResponded(sharedSurveyId, wallet.publicKey);
+                if (!cancelled) setSharedSurveyState((prev) => ({ ...prev, hasResponded: Boolean(value) }));
+            } catch { /* tolerate */ }
+        })();
+        return () => { cancelled = true; };
+    }, [sharedSurveyId, wallet]);
+
+    const exitSharedMode = () => {
+        setSharedSurveyId(null);
+        if (typeof window !== "undefined") {
+            window.history.replaceState({}, "", window.location.pathname);
         }
-    }, [refreshTotal, refreshExplore]);
+        refreshTotal();
+        refreshExplore();
+    };
 
-    // ---- Action runner ----
+    // ---- action runner ----
     const run = async (actionKey, label, fn, { onSuccess, refresh } = {}) => {
         setBusyAction(actionKey);
         const txId = addTx(label);
@@ -226,7 +302,7 @@ export default function App() {
             if (onSuccess) await onSuccess(value);
             if (refresh?.total) await refreshTotal();
             if (refresh?.explore) await refreshExplore();
-            if (refresh?.participantsOf) await refreshParticipants(refresh.participantsOf);
+            if (refresh?.responsesOf) await refreshResponses(refresh.responsesOf);
             return value;
         } catch (error) {
             const message = error?.message || String(error);
@@ -246,7 +322,7 @@ export default function App() {
         return true;
     };
 
-    // ---- Wallet ----
+    // ---- wallet ----
     const onConnect = () =>
         run("connect", "Connecting wallet", async () => {
             const user = await connectWallet();
@@ -263,42 +339,72 @@ export default function App() {
         setResult({ kind: "info", title: "Wallet disconnected", body: "Connect again to perform transactions." });
     };
 
-    // ---- Survey actions ----
+    // ---- create ----
+    const updateCreate = (patch) => setCreateForm((prev) => ({ ...prev, ...patch }));
+
+    const onTitleBlur = () => {
+        if (!createForm.id || createForm.id.startsWith("survey_")) {
+            updateCreate({ id: slugifyId(createForm.title) });
+        }
+    };
+
+    const onAddQuestion = () => updateCreate({ questions: [...createForm.questions, ""] });
+    const onRemoveQuestion = (index) =>
+        updateCreate({ questions: createForm.questions.filter((_, i) => i !== index) });
+    const onSetQuestion = (index, value) => {
+        const next = [...createForm.questions];
+        next[index] = value;
+        updateCreate({ questions: next });
+    };
+
     const onCreate = () => {
         if (!requireWallet()) return;
-        run("create", "Creating survey", () => createSurvey({
-            id: form.id.trim(),
+        const trimmedQuestions = createForm.questions.map((q) => q.trim()).filter(Boolean);
+        if (trimmedQuestions.length === 0) {
+            setResult({ kind: "error", title: "Add at least one question", body: "Use the +Add Question button to add questions before publishing." });
+            return;
+        }
+        const endUnix = localInputToUnix(createForm.endTimeLocal);
+        if (!endUnix || Number(endUnix) <= nowTs()) {
+            setResult({ kind: "error", title: "End time must be in the future", body: "Pick a date and time later than now." });
+            return;
+        }
+
+        run("create", `Create ${createForm.id}`, () => createSurvey({
+            id: createForm.id.trim(),
             creator: wallet.publicKey,
-            title: form.title.trim(),
-            description: form.description.trim(),
-            questionCount: form.questionCount.trim(),
-            endTime: form.endTime.trim(),
-            maxResponses: form.maxResponses.trim(),
-            rewardStroops: xlmToStroops(form.rewardXlm.trim()),
+            title: createForm.title.trim(),
+            description: createForm.description.trim(),
+            questions: trimmedQuestions,
+            endTime: endUnix,
+            maxResponses: createForm.maxResponses.trim() || "0",
+            rewardStroops: xlmToStroops(createForm.rewardXlm.trim() || "0"),
         }), {
             onSuccess: () => {
                 setResult({
                     kind: "success",
-                    title: `Survey "${form.id}" created`,
-                    body: { kind: "create", id: form.id, title: form.title, reward: form.rewardXlm },
+                    title: `Survey "${createForm.title}" published`,
+                    body: { kind: "create", id: createForm.id, title: createForm.title, reward: createForm.rewardXlm, count: trimmedQuestions.length },
                 });
+                setCreateForm(emptyCreateForm());
             },
             refresh: { total: true, explore: true },
         });
     };
 
-    const onPause = () => {
-        if (!requireWallet()) return;
-        run("pause", `Pause ${form.manageId}`, () =>
-            pauseSurvey({ id: form.manageId.trim(), creator: wallet.publicKey }),
-            { refresh: { explore: true } });
-    };
-    const onResume = () => {
-        if (!requireWallet()) return;
-        run("resume", `Resume ${form.manageId}`, () =>
-            resumeSurvey({ id: form.manageId.trim(), creator: wallet.publicKey }),
-            { refresh: { explore: true } });
-    };
+    // ---- manage ----
+    const selectForManage = useCallback((id) => {
+        const s = surveysById[id];
+        setManageId(id);
+        setManageForm({
+            newEndTimeLocal: s ? unixToLocalInput(s.end_time) : "",
+            manageRewardXlm: s ? stroopsToXlm(s.reward_per_response) : "0",
+            whitelistAddrs: "",
+        });
+        if (!responsesById[id]) refreshResponses(id);
+    }, [surveysById, responsesById, refreshResponses]);
+
+    const updateManage = (patch) => setManageForm((prev) => ({ ...prev, ...patch }));
 
     const handleConfirm = (key, action) => {
         if (confirmKey === key) {
@@ -312,176 +418,163 @@ export default function App() {
         }
     };
 
+    const onPause = () => {
+        if (!requireWallet() || !manageId) return;
+        run("pause", `Pause ${manageId}`, () =>
+            pauseSurvey({ id: manageId, creator: wallet.publicKey }),
+            { refresh: { explore: true } });
+    };
+    const onResume = () => {
+        if (!requireWallet() || !manageId) return;
+        run("resume", `Resume ${manageId}`, () =>
+            resumeSurvey({ id: manageId, creator: wallet.publicKey }),
+            { refresh: { explore: true } });
+    };
     const onClose = () => {
-        if (!requireWallet()) return;
+        if (!requireWallet() || !manageId) return;
         handleConfirm("close", () =>
-            run("close", `Close ${form.manageId}`, () =>
-                closeSurvey({ id: form.manageId.trim(), creator: wallet.publicKey }),
+            run("close", `Close ${manageId}`, () =>
+                closeSurvey({ id: manageId, creator: wallet.publicKey }),
                 { refresh: { explore: true } }));
     };
-
     const onExtend = () => {
-        if (!requireWallet()) return;
-        run("extend", `Extend ${form.manageId}`, () => extendSurvey({
-            id: form.manageId.trim(),
+        if (!requireWallet() || !manageId) return;
+        const unix = localInputToUnix(manageForm.newEndTimeLocal);
+        if (!unix) { setResult({ kind: "error", title: "Pick a new end time", body: "Choose a future date and time." }); return; }
+        run("extend", `Extend ${manageId}`, () => extendSurvey({
+            id: manageId,
             creator: wallet.publicKey,
-            newEndTime: form.newEndTime.trim(),
+            newEndTime: unix,
         }), { refresh: { explore: true } });
     };
-
     const onUpdateReward = () => {
-        if (!requireWallet()) return;
-        run("update_reward", `Update reward ${form.manageId}`, () => updateReward({
-            id: form.manageId.trim(),
+        if (!requireWallet() || !manageId) return;
+        run("update_reward", `Update reward ${manageId}`, () => updateReward({
+            id: manageId,
             creator: wallet.publicKey,
-            rewardStroops: xlmToStroops(form.manageRewardXlm.trim()),
+            rewardStroops: xlmToStroops(manageForm.manageRewardXlm.trim() || "0"),
         }), { refresh: { explore: true } });
     };
-
     const onEnableWhitelist = () => {
-        if (!requireWallet()) return;
-        run("enable_wl", `Enable whitelist ${form.manageId}`, () =>
-            enableWhitelist({ id: form.manageId.trim(), creator: wallet.publicKey }));
+        if (!requireWallet() || !manageId) return;
+        run("enable_wl", `Enable whitelist ${manageId}`, () =>
+            enableWhitelist({ id: manageId, creator: wallet.publicKey }));
     };
-
     const onAddWhitelist = () => {
-        if (!requireWallet()) return;
-        const addresses = form.whitelistAddrs.split(/[\s,]+/).map((value) => value.trim()).filter(Boolean);
+        if (!requireWallet() || !manageId) return;
+        const addresses = manageForm.whitelistAddrs.split(/[\s,]+/).map((v) => v.trim()).filter(Boolean);
         if (!addresses.length) {
-            setResult({ kind: "error", title: "Whitelist", body: "Enter at least one address" });
+            setResult({ kind: "error", title: "Whitelist", body: "Enter at least one address." });
             return;
         }
         run("add_wl", `Whitelist +${addresses.length}`, () => addToWhitelist({
-            id: form.manageId.trim(),
+            id: manageId,
             creator: wallet.publicKey,
             addresses,
-        }));
+        }), {
+            onSuccess: () => updateManage({ whitelistAddrs: "" }),
+        });
+    };
+
+    // ---- respond ----
+    const selectForRespond = useCallback((id) => {
+        setRespondId(id);
+        const s = surveysById[id];
+        if (s) setAnswers(new Array(s.questions.length).fill(""));
+    }, [surveysById]);
+
+    useEffect(() => {
+        const s = surveysById[respondId];
+        if (s && answers.length !== s.questions.length) {
+            setAnswers(new Array(s.questions.length).fill(""));
+        }
+    }, [respondId, surveysById, answers.length]);
+
+    const setAnswer = (index, value) => {
+        setAnswers((prev) => {
+            const next = [...prev];
+            next[index] = value;
+            return next;
+        });
     };
 
     const onSubmitResponse = () => {
-        if (!requireWallet()) return;
-        run("respond", `Respond to ${form.respondId}`, () => submitResponse({
-            surveyId: form.respondId.trim(),
+        if (!requireWallet() || !respondId) return;
+        const survey = surveysById[respondId];
+        if (!survey) {
+            setResult({ kind: "error", title: "Survey not found", body: respondId });
+            return;
+        }
+        if (answers.some((a, i) => i < survey.questions.length && !a.trim())) {
+            setResult({ kind: "error", title: "Answer all questions", body: "Each question needs a response before submitting." });
+            return;
+        }
+        const payload = JSON.stringify(answers.slice(0, survey.questions.length).map((a) => a.trim()));
+        run("respond", `Respond to ${respondId}`, () => submitResponse({
+            surveyId: respondId,
             respondent: wallet.publicKey,
-            answers: form.answers.trim(),
+            answers: payload,
         }), {
             onSuccess: () => {
                 setResult({
                     kind: "success",
                     title: "Response submitted",
-                    body: { kind: "respond", surveyId: form.respondId, answers: form.answers },
+                    body: { kind: "respond", surveyId: respondId },
                 });
+                setAnswers(new Array(survey.questions.length).fill(""));
+                if (sharedSurveyId === respondId) {
+                    setSharedSurveyState((prev) => ({ ...prev, submitted: true, hasResponded: true }));
+                }
             },
-            refresh: { explore: true, participantsOf: form.respondId.trim() },
+            refresh: sharedSurveyId ? {} : { explore: true, responsesOf: respondId },
         });
     };
 
-    // ---- Read queries ----
-    const onGetSurvey = () =>
-        run("getSurvey", `Read survey ${form.querySurveyId}`, async () => {
-            const data = await getSurvey(form.querySurveyId.trim());
-            const normalized = normalizeSurvey(data);
-            if (!normalized) {
-                setResult({ kind: "error", title: "Survey not found", body: form.querySurveyId });
-                return null;
+    // ---- analytics ----
+    const loadAnalytics = useCallback(async (id) => {
+        if (!id) return;
+        setAnalyticsId(id);
+        setAnalyticsLoading(true);
+        setAnalyticsCheck({ accepting: null, hasResponded: null, respondent: "" });
+        try {
+            const [surveyRaw, accepting] = await Promise.all([
+                getSurvey(id).catch(() => null),
+                isAcceptingResponses(id).catch(() => null),
+            ]);
+            const normalized = normalizeSurvey(surveyRaw);
+            if (normalized) {
+                setSurveysById((prev) => ({ ...prev, [id]: normalized }));
             }
-            setSurveysById((prev) => ({ ...prev, [normalized.id]: normalized }));
-            setResult({ kind: "success", title: `Survey · ${normalized.id}`, body: { kind: "survey", survey: normalized } });
-            return { hash: null };
-        });
-
-    const onListSurveys = () =>
-        run("list", "Read survey list", async () => {
-            await refreshExplore();
-            return { hash: null };
-        }, {
-            onSuccess: () => setResult({
-                kind: "success",
-                title: "Survey list refreshed",
-                body: { kind: "ids", ids: surveyIds },
-            }),
-        });
-
-    const onResponseCount = () =>
-        run("respCount", `Read response count ${form.querySurveyId}`, async () => {
-            const value = await getResponseCount(form.querySurveyId.trim());
-            setResult({
-                kind: "success",
-                title: `Response count · ${form.querySurveyId}`,
-                body: { kind: "stat", stat: "Responses", value: Number(value) },
-            });
-            return { hash: null };
-        });
-
-    const onHasResponded = () =>
-        run("hasResp", "Check has responded", async () => {
-            const target = form.queryRespondent.trim() || wallet?.publicKey;
-            if (!target) throw new Error("Provide a respondent address or connect a wallet");
-            const value = await hasResponded(form.querySurveyId.trim(), target);
-            setResult({
-                kind: "success",
-                title: "Response check",
-                body: { kind: "boolean", label: `Has ${truncate(target)} responded?`, value: Boolean(value) },
-            });
-            return { hash: null };
-        });
-
-    const onIsAccepting = () =>
-        run("accepting", "Check accepting", async () => {
-            const value = await isAcceptingResponses(form.querySurveyId.trim());
-            setResult({
-                kind: "success",
-                title: "Accepting responses",
-                body: { kind: "boolean", label: `${form.querySurveyId} is accepting?`, value: Boolean(value) },
-            });
-            return { hash: null };
-        });
-
-    const onTotalCount = () =>
-        run("total", "Read total count", async () => {
-            const value = await getTotalCount();
-            const num = typeof value === "bigint" ? Number(value) : Number(value || 0);
-            setTotalCount(num);
-            setResult({
-                kind: "success",
-                title: "Total surveys on-chain",
-                body: { kind: "stat", stat: "Total Surveys", value: num },
-            });
-            return { hash: null };
-        });
-
-    const onLoadParticipants = (id) =>
-        run("participants", `Load participants ${id}`, async () => {
-            const list = await refreshParticipants(id);
-            setResult({
-                kind: "success",
-                title: `Participants · ${id}`,
-                body: { kind: "participants", surveyId: id, list: list || [] },
-            });
-            return { hash: null };
-        });
-
-    // ---- Survey row actions ----
-    const openSurveyDetail = async (id) => {
-        setSelectedSurvey(id);
-        if (!participantsById[id]) {
-            await refreshParticipants(id);
+            setAnalyticsCheck((prev) => ({ ...prev, accepting }));
+            await refreshResponses(id);
+        } catch {
+            /* tolerate partial */
+        } finally {
+            setAnalyticsLoading(false);
         }
-    };
+    }, [refreshResponses]);
 
-    const startRespond = (id) => {
-        patchForm({ respondId: id });
-        setActiveNav("respond");
-    };
-
-    const startManage = (id) => {
-        const s = surveysById[id];
-        patchForm({
-            manageId: id,
-            manageRewardXlm: s ? stroopsToXlm(s.reward_per_response) : "0",
+    const onCheckHasResponded = (address) => {
+        if (!analyticsId) return;
+        const target = (address || analyticsCheck.respondent || wallet?.publicKey || "").trim();
+        if (!target) {
+            setResult({ kind: "error", title: "Address required", body: "Connect a wallet or paste an address to check." });
+            return;
+        }
+        run("hasResp", `Check ${truncate(target)}`, async () => {
+            const value = await hasResponded(analyticsId, target);
+            setAnalyticsCheck((prev) => ({ ...prev, respondent: target, hasResponded: Boolean(value) }));
+            return { hash: null };
         });
-        setActiveNav("manage");
     };
+
+    const refreshTotalAndExplore = useCallback(async () => {
+        await Promise.all([refreshTotal(), refreshExplore()]);
+    }, [refreshTotal, refreshExplore]);
+
+    // ---- explore actions ----
+    const startManageFromExplore = (id) => { selectForManage(id); setActiveNav("manage"); };
+    const startRespondFromExplore = (id) => { selectForRespond(id); setActiveNav("respond"); };
 
     const shareSurvey = async (id) => {
         const url = `${window.location.origin}${window.location.pathname}?survey=${encodeURIComponent(id)}`;
@@ -497,13 +590,13 @@ export default function App() {
         }
     };
 
-    // ---- Payments ----
+    // ---- payments ----
     const openPayment = (recipient, context) => {
         if (!wallet) {
             setResult({ kind: "error", title: "Connect wallet", body: "Connect Freighter to send a payment." });
             return;
         }
-        setPaymentModal({ recipient, ...context, amount: "1", memo: context?.surveyId || "Survey reward" });
+        setPaymentModal({ recipient, ...context, amount: "1", memo: context?.surveyId ? `Reward · ${context.surveyId}` : "Survey reward" });
     };
 
     const submitPayment = async () => {
@@ -526,13 +619,28 @@ export default function App() {
         });
     };
 
-    // ---- Derived ----
+    // ---- derived data ----
     const sortedSurveyIds = useMemo(() => {
         return [...surveyIds].sort((a, b) => {
             const sa = surveysById[a]; const sb = surveysById[b];
             return (sb?.created_at || 0) - (sa?.created_at || 0);
         });
     }, [surveyIds, surveysById]);
+
+    const mySurveys = useMemo(() => {
+        if (!wallet) return [];
+        return sortedSurveyIds
+            .map((id) => surveysById[id])
+            .filter((s) => s && s.creator === wallet.publicKey);
+    }, [wallet, sortedSurveyIds, surveysById]);
+
+    const availableSurveys = useMemo(() => {
+        const now = nowTs();
+        return sortedSurveyIds
+            .map((id) => surveysById[id])
+            .filter((s) => s && s.status === "Active" && s.end_time > now &&
+                (s.max_responses === 0 || s.response_count < s.max_responses));
+    }, [sortedSurveyIds, surveysById]);
 
     const isBusy = busyAction != null;
 
@@ -548,12 +656,27 @@ export default function App() {
         </button>
     );
 
-    const StatusPill = ({ status }) => {
-        const cls = status === "Active" ? "pill-active" :
-                    status === "Paused" ? "pill-paused" :
-                    status === "Closed" ? "pill-closed" : "pill-default";
-        return <span className={`status-pill ${cls}`}>{status}</span>;
-    };
+    if (sharedSurveyId) {
+        return (
+            <>
+                <SharedRespondPage
+                    state={sharedSurveyState}
+                    surveyId={sharedSurveyId}
+                    wallet={wallet}
+                    answers={answers}
+                    onSetAnswer={setAnswer}
+                    onConnect={onConnect}
+                    onDisconnect={onDisconnect}
+                    onSubmit={onSubmitResponse}
+                    onExit={exitSharedMode}
+                    connecting={busyAction === "connect"}
+                    submitting={busyAction === "respond"}
+                    disabled={isBusy}
+                />
+                <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />
+            </>
+        );
+    }
 
     return (
         <div className="layout">
@@ -579,7 +702,6 @@ export default function App() {
                         >
                             <span className="nav-num">{item.num}</span>
                             <span className="nav-label">{item.label}</span>
-                            {activeNav === item.key && <span className="nav-bar" />}
                         </button>
                     ))}
                 </nav>
@@ -625,10 +747,10 @@ export default function App() {
                     <div className="topbar-left">
                         <h1 className="page-title">{NAV.find((n) => n.key === activeNav)?.label}</h1>
                         <span className="page-sub">
-                            {activeNav === "explore" && "Browse all surveys, share, and discover"}
-                            {activeNav === "create" && "Publish a new survey on-chain"}
-                            {activeNav === "manage" && "Lifecycle controls and whitelisting"}
-                            {activeNav === "respond" && "Submit a response — your address is your signature"}
+                            {activeNav === "explore" && "Browse surveys, share links, peek at participants"}
+                            {activeNav === "create" && "Build your questions and publish on-chain"}
+                            {activeNav === "manage" && "Edit your surveys and review every response"}
+                            {activeNav === "respond" && "Pick a survey and answer the questions"}
                             {activeNav === "analytics" && "Read-only contract queries"}
                         </span>
                     </div>
@@ -645,119 +767,115 @@ export default function App() {
                         <ExplorePanel
                             ids={sortedSurveyIds}
                             surveys={surveysById}
-                            participants={participantsById}
+                            responses={responsesById}
                             loading={exploreLoading}
                             onRefresh={refreshExplore}
-                            onView={openSurveyDetail}
-                            onRespond={startRespond}
-                            onManage={startManage}
+                            onExpand={(id) => {
+                                setExpandedSurvey(id);
+                                if (!responsesById[id]) refreshResponses(id);
+                            }}
+                            onCollapse={() => setExpandedSurvey(null)}
+                            onRespond={startRespondFromExplore}
+                            onManage={startManageFromExplore}
                             onShare={shareSurvey}
-                            onLoadParticipants={onLoadParticipants}
                             onTip={(addr, surveyId) => openPayment(addr, { surveyId })}
+                            onLoadResponses={(id) =>
+                                run("loadResp", `Load responses ${id}`, async () => {
+                                    await refreshResponses(id);
+                                    return { hash: null };
+                                })
+                            }
                             wallet={wallet}
-                            selected={selectedSurvey}
+                            expanded={expandedSurvey}
                         />
                     )}
 
                     {activeNav === "create" && (
-                        <Section title="Create a Survey" tag="create_survey">
-                            <div className="grid-2">
-                                <Field label="Survey ID (Symbol)" name="id" value={form.id} onChange={setField} hint="Unique on-chain identifier (max 32 chars, letters/numbers/_)" />
-                                <Field label="Title" name="title" value={form.title} onChange={setField} />
-                                <Field label="Question Count" name="questionCount" type="number" value={form.questionCount} onChange={setField} />
-                                <Field label="Max Responses" name="maxResponses" type="number" value={form.maxResponses} onChange={setField} hint="0 = unlimited" />
-                                <Field label="End Time (UNIX)" name="endTime" type="number" value={form.endTime} onChange={setField} hint={`Now: ${nowTs()} · 1 day from now: ${dayFromNow()}`} />
-                                <Field label="Reward per Response (XLM)" name="rewardXlm" value={form.rewardXlm} onChange={setField} hint="Informational. Tipping is settled via direct payment from creator." />
-                            </div>
-                            <Field label="Description" name="description" textarea rows={3} value={form.description} onChange={setField} />
-                            <Field label="Creator" value={wallet ? wallet.publicKey : "Connect wallet to auto-fill"} readOnly />
-                            <div className="row">
-                                <Btn id="create" label="Publish Survey" onClick={onCreate} icon="↗" />
-                            </div>
-                        </Section>
+                        <CreatePanel
+                            form={createForm}
+                            wallet={wallet}
+                            onTitleBlur={onTitleBlur}
+                            onChange={(e) => updateCreate({ [e.target.name]: e.target.value })}
+                            onSetQuestion={onSetQuestion}
+                            onAddQuestion={onAddQuestion}
+                            onRemoveQuestion={onRemoveQuestion}
+                            onSubmit={onCreate}
+                            busyKey={busyAction}
+                            disabled={isBusy}
+                        />
                     )}
 
                     {activeNav === "manage" && (
-                        <>
-                            <Section title="Manage Survey" tag="creator-only">
-                                <div className="grid-2">
-                                    <Field label="Survey ID" name="manageId" value={form.manageId} onChange={setField} />
-                                    <Field label="New End Time (UNIX)" name="newEndTime" type="number" value={form.newEndTime} onChange={setField} />
-                                </div>
-                                <div className="row wrap">
-                                    <Btn id="pause" label="Pause" variant="outline" onClick={onPause} />
-                                    <Btn id="resume" label="Resume" variant="outline" onClick={onResume} />
-                                    <Btn id="extend" label="Extend End Time" variant="outline" onClick={onExtend} />
-                                    <Btn id="close" label="Close Survey" variant="danger" onClick={onClose} confirmLabel="Confirm Close?" />
-                                </div>
-                            </Section>
-
-                            <Section title="Update Reward" tag="update_reward">
-                                <div className="grid-2">
-                                    <Field label="New Reward per Response (XLM)" name="manageRewardXlm" value={form.manageRewardXlm} onChange={setField} hint="Set to 0 to clear" />
-                                </div>
-                                <div className="row">
-                                    <Btn id="update_reward" label="Update Reward" variant="outline" onClick={onUpdateReward} />
-                                </div>
-                            </Section>
-
-                            <Section title="Whitelist" tag="enable + add">
-                                <Field
-                                    label="Addresses"
-                                    name="whitelistAddrs"
-                                    textarea
-                                    rows={3}
-                                    value={form.whitelistAddrs}
-                                    onChange={setField}
-                                    hint="Comma or newline separated. Each must be a valid G... Stellar account."
-                                />
-                                <div className="row wrap">
-                                    <Btn id="enable_wl" label="Enable Whitelist" variant="outline" onClick={onEnableWhitelist} />
-                                    <Btn id="add_wl" label="Add Addresses" onClick={onAddWhitelist} />
-                                </div>
-                            </Section>
-                        </>
+                        <ManagePanel
+                            wallet={wallet}
+                            mySurveys={mySurveys}
+                            selectedId={manageId}
+                            survey={surveysById[manageId]}
+                            responses={responsesById[manageId]}
+                            form={manageForm}
+                            onSelect={selectForManage}
+                            onChange={updateManage}
+                            onPause={onPause}
+                            onResume={onResume}
+                            onClose={onClose}
+                            onExtend={onExtend}
+                            onUpdateReward={onUpdateReward}
+                            onEnableWhitelist={onEnableWhitelist}
+                            onAddWhitelist={onAddWhitelist}
+                            onShare={shareSurvey}
+                            onTip={(addr, sid) => openPayment(addr, { surveyId: sid })}
+                            onReloadResponses={() => refreshResponses(manageId)}
+                            busyAction={busyAction}
+                            confirmKey={confirmKey}
+                            disabled={isBusy}
+                        />
                     )}
 
                     {activeNav === "respond" && (
-                        <Section title="Submit Response" tag="submit_response">
-                            <div className="grid-2">
-                                <Field label="Survey ID" name="respondId" value={form.respondId} onChange={setField} />
-                                <Field label="Respondent" value={wallet ? wallet.publicKey : "Connect wallet"} readOnly />
-                            </div>
-                            <Field
-                                label="Answers"
-                                name="answers"
-                                textarea
-                                rows={3}
-                                value={form.answers}
-                                onChange={setField}
-                                hint="Free-form string — JSON, CSV, base64, your call. Stored off-chain; participation tracked on-chain."
-                            />
-                            <div className="row">
-                                <Btn id="respond" label="Submit Response" onClick={onSubmitResponse} icon="✓" />
-                            </div>
-                        </Section>
+                        <RespondPanel
+                            wallet={wallet}
+                            available={availableSurveys}
+                            allSurveys={surveysById}
+                            selectedId={respondId}
+                            survey={surveysById[respondId]}
+                            answers={answers}
+                            onSelect={selectForRespond}
+                            onSetAnswer={setAnswer}
+                            onSubmit={onSubmitResponse}
+                            onConnect={onConnect}
+                            onShare={shareSurvey}
+                            connecting={busyAction === "connect"}
+                            submitting={busyAction === "respond"}
+                            disabled={isBusy}
+                        />
                     )}
 
                     {activeNav === "analytics" && (
-                        <Section title="Read-only Queries" tag="simulated">
-                            <div className="grid-2">
-                                <Field label="Survey ID" name="querySurveyId" value={form.querySurveyId} onChange={setField} />
-                                <Field label="Respondent (optional)" name="queryRespondent" value={form.queryRespondent} onChange={setField} placeholder="Defaults to your wallet" />
-                            </div>
-                            <div className="row wrap">
-                                <Btn id="getSurvey" label="Get Survey" variant="outline" onClick={onGetSurvey} />
-                                <Btn id="list" label="List Surveys" variant="outline" onClick={onListSurveys} />
-                                <Btn id="respCount" label="Response Count" variant="outline" onClick={onResponseCount} />
-                                <Btn id="hasResp" label="Has Responded?" variant="outline" onClick={onHasResponded} />
-                                <Btn id="accepting" label="Accepting?" variant="outline" onClick={onIsAccepting} />
-                                <Btn id="total" label="Total Count" variant="ghost" onClick={onTotalCount} />
-                            </div>
-                        </Section>
+                        <AnalyticsPanel
+                            wallet={wallet}
+                            scope={analyticsScope}
+                            onSetScope={setAnalyticsScope}
+                            mySurveys={mySurveys}
+                            allIds={sortedSurveyIds}
+                            surveys={surveysById}
+                            responses={responsesById}
+                            selectedId={analyticsId}
+                            onSelect={loadAnalytics}
+                            check={analyticsCheck}
+                            onSetCheck={setAnalyticsCheck}
+                            loading={analyticsLoading}
+                            onCheckHasResponded={onCheckHasResponded}
+                            onShare={shareSurvey}
+                            onTip={(addr, sid) => openPayment(addr, { surveyId: sid })}
+                            onReloadResponses={() => refreshResponses(analyticsId)}
+                            onRefresh={refreshTotalAndExplore}
+                            totalCount={totalCount}
+                            busyAction={busyAction}
+                            disabled={isBusy}
+                        />
                     )}
 
-                    <ResultPanel result={result} onTip={(addr, surveyId) => openPayment(addr, { surveyId })} />
+                    <ResultPanel result={result} />
 
                     <footer className="foot">
                         <span>Built on Soroban · Stellar Testnet</span>
@@ -766,18 +884,17 @@ export default function App() {
                 </main>
             </div>
 
-            {/* ===== Transaction Status Drawer ===== */}
-            <TxDrawer transactions={transactions} onDismiss={dismissTx} />
+            <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />
 
-            {/* ===== Payment Modal ===== */}
-            {paymentModal && (
+            {paymentModal && createPortal(
                 <PaymentModal
                     state={paymentModal}
                     onChange={(patch) => setPaymentModal((p) => ({ ...p, ...patch }))}
                     onClose={() => setPaymentModal(null)}
                     onSubmit={submitPayment}
                     busy={busyAction === "payment"}
-                />
+                />,
+                document.body,
             )}
         </div>
     );
@@ -797,27 +914,414 @@ function Section({ title, tag, children }) {
     );
 }
 
-function Field({ label, name, value, onChange, type = "text", hint, textarea, rows = 2, readOnly, placeholder }) {
+function Field({ label, name, value, onChange, type = "text", hint, textarea, rows = 2, readOnly, placeholder, onBlur }) {
     return (
         <div className={`field ${readOnly ? "field-ro" : ""}`}>
             <label>{label}</label>
             {textarea ? (
-                <textarea name={name} value={value} onChange={onChange} rows={rows} readOnly={readOnly} placeholder={placeholder} />
+                <textarea name={name} value={value} onChange={onChange} rows={rows} readOnly={readOnly} placeholder={placeholder} onBlur={onBlur} />
             ) : (
-                <input name={name} value={value} onChange={onChange} type={type} readOnly={readOnly} placeholder={placeholder} />
+                <input name={name} value={value} onChange={onChange} type={type} readOnly={readOnly} placeholder={placeholder} onBlur={onBlur} />
             )}
             {hint && <span className="hint">{hint}</span>}
         </div>
     );
 }
 
-function ExplorePanel({ ids, surveys, participants, loading, onRefresh, onView, onRespond, onManage, onShare, onLoadParticipants, onTip, wallet, selected }) {
+function StatusPill({ status }) {
+    const cls = (status || "").toLowerCase();
+    return <span className={`status-pill pill-${cls}`}>{status}</span>;
+}
+
+function Stat({ label, value, small }) {
+    return (
+        <div className="meta-stat">
+            <span className="meta-label">{label}</span>
+            <span className={`meta-value ${small ? "small" : ""}`}>{value}</span>
+        </div>
+    );
+}
+
+// ---------- Create ----------
+function CreatePanel({ form, wallet, onTitleBlur, onChange, onSetQuestion, onAddQuestion, onRemoveQuestion, onSubmit, busyKey, disabled }) {
+    const endUnix = localInputToUnix(form.endTimeLocal);
+    return (
+        <Section title="Create a Survey" tag="create_survey">
+            <div className="grid-2">
+                <Field label="Title" name="title" value={form.title} onChange={onChange} onBlur={onTitleBlur} placeholder="What do you want to ask?" />
+                <Field label="Survey ID" name="id" value={form.id} onChange={onChange} hint="Unique on-chain identifier (auto-generated from title — letters, numbers, underscore, max 32)." />
+            </div>
+            <Field label="Description" name="description" textarea rows={2} value={form.description} onChange={onChange} placeholder="Optional context for respondents." />
+
+            <div className="builder">
+                <div className="builder-head">
+                    <label>Questions</label>
+                    <span className="hint">{form.questions.length} question{form.questions.length === 1 ? "" : "s"}</span>
+                </div>
+                {form.questions.map((q, i) => (
+                    <div className="question-row" key={i}>
+                        <span className="q-num">Q{i + 1}</span>
+                        <input
+                            value={q}
+                            onChange={(e) => onSetQuestion(i, e.target.value)}
+                            placeholder={`Question ${i + 1}`}
+                        />
+                        <button
+                            type="button"
+                            className="icon-btn-danger"
+                            onClick={() => onRemoveQuestion(i)}
+                            disabled={form.questions.length <= 1}
+                            title="Remove question"
+                        >
+                            ×
+                        </button>
+                    </div>
+                ))}
+                <button type="button" className="btn btn-outline btn-sm builder-add" onClick={onAddQuestion}>
+                    + Add Question
+                </button>
+            </div>
+
+            <div className="grid-2">
+                <Field label="Closes At" name="endTimeLocal" type="datetime-local" value={form.endTimeLocal} onChange={onChange} hint={endUnix ? `${formatUnix(endUnix)} · ${formatRelative(endUnix)}` : "Pick a future date and time"} />
+                <Field label="Max Responses" name="maxResponses" type="number" value={form.maxResponses} onChange={onChange} hint="0 = unlimited" />
+                <Field label="Reward per Response (XLM)" name="rewardXlm" value={form.rewardXlm} onChange={onChange} hint="Informational. Tip respondents directly from Manage." />
+                <Field label="Creator" value={wallet ? wallet.publicKey : "Connect wallet to auto-fill"} readOnly />
+            </div>
+
+            <div className="row">
+                <button
+                    type="button"
+                    className={`btn btn-primary ${busyKey === "create" ? "is-loading" : ""}`}
+                    onClick={onSubmit}
+                    disabled={disabled}
+                >
+                    Publish Survey
+                </button>
+            </div>
+        </Section>
+    );
+}
+
+// ---------- Manage ----------
+function ManageBtn({ id, label, variant = "primary", onClick, confirmKey, confirmLabel, busyAction, disabled }) {
+    const isActive = confirmKey === id;
+    const isLoading = busyAction === id;
+    return (
+        <button
+            type="button"
+            className={`btn btn-${variant} ${isLoading ? "is-loading" : ""}`}
+            onClick={onClick}
+            disabled={disabled}
+        >
+            {isActive ? confirmLabel || "Confirm?" : label}
+        </button>
+    );
+}
+
+function ManagePanel({ wallet, mySurveys, selectedId, survey, responses, form, onSelect, onChange, onPause, onResume, onClose, onExtend, onUpdateReward, onEnableWhitelist, onAddWhitelist, onShare, onTip, onReloadResponses, busyAction, confirmKey, disabled }) {
+    if (!wallet) {
+        return (
+            <Section title="Manage Surveys" tag="creator-only">
+                <div className="empty-state inset">
+                    <span className="empty-icon">⚠</span>
+                    <h3>Connect a wallet</h3>
+                    <p>Connect Freighter to see and edit surveys you've created.</p>
+                </div>
+            </Section>
+        );
+    }
+    if (mySurveys.length === 0) {
+        return (
+            <Section title="Manage Surveys" tag="creator-only">
+                <div className="empty-state inset">
+                    <span className="empty-icon">∅</span>
+                    <h3>No surveys created yet</h3>
+                    <p>Head to <strong>01 / Create</strong> to publish your first survey.</p>
+                </div>
+            </Section>
+        );
+    }
+
+    return (
+        <div className="manage-grid">
+            <aside className="manage-list card">
+                <div className="panel-head">
+                    <h2>My Surveys</h2>
+                    <span className="panel-tag">{mySurveys.length}</span>
+                </div>
+                <ul className="manage-list-ul">
+                    {mySurveys.map((s) => (
+                        <li key={s.id}>
+                            <button
+                                type="button"
+                                className={`manage-list-item ${selectedId === s.id ? "is-active" : ""}`}
+                                onClick={() => onSelect(s.id)}
+                            >
+                                <div className="manage-list-top">
+                                    <span className="survey-id-tag">{s.id}</span>
+                                    <StatusPill status={s.status} />
+                                </div>
+                                <span className="manage-list-title">{s.title}</span>
+                                <span className="manage-list-meta">
+                                    {s.response_count} responses · ends {formatRelative(s.end_time)}
+                                </span>
+                            </button>
+                        </li>
+                    ))}
+                </ul>
+            </aside>
+
+            <div className="manage-detail">
+                {survey ? (
+                    <>
+                        <Section title={survey.title} tag={survey.id}>
+                            <div className="manage-summary">
+                                <StatusPill status={survey.status} />
+                                <Stat label="Responses" value={`${survey.response_count}${survey.max_responses ? ` / ${survey.max_responses}` : ""}`} />
+                                <Stat label="Questions" value={survey.question_count} />
+                                <Stat label="Reward" value={`${stroopsToXlm(survey.reward_per_response)} XLM`} />
+                                <Stat label="Ends" value={`${formatUnix(survey.end_time)}`} small />
+                                <Stat label="Created" value={`${formatUnix(survey.created_at)}`} small />
+                            </div>
+                            <p className="manage-desc">{survey.description || <em>No description</em>}</p>
+
+                            <div className="row wrap manage-actions">
+                                <ManageBtn id="pause" label="Pause" variant="outline" onClick={onPause} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                                <ManageBtn id="resume" label="Resume" variant="outline" onClick={onResume} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                                <ManageBtn id="close" label="Close Survey" variant="danger" onClick={onClose} confirmLabel="Confirm Close?" busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                                <button type="button" className="btn btn-ghost" onClick={() => onShare(survey.id)}>↗ Share Link</button>
+                            </div>
+                        </Section>
+
+                        <Section title="Schedule & Reward" tag="lifecycle">
+                            <div className="grid-2">
+                                <Field
+                                    label="New End Time"
+                                    name="newEndTimeLocal"
+                                    type="datetime-local"
+                                    value={form.newEndTimeLocal}
+                                    onChange={(e) => onChange({ newEndTimeLocal: e.target.value })}
+                                    hint={form.newEndTimeLocal ? `${formatUnix(localInputToUnix(form.newEndTimeLocal))} · ${formatRelative(localInputToUnix(form.newEndTimeLocal))}` : "Must be later than current end"}
+                                />
+                                <Field
+                                    label="Reward per Response (XLM)"
+                                    value={form.manageRewardXlm}
+                                    onChange={(e) => onChange({ manageRewardXlm: e.target.value })}
+                                    hint="0 to clear"
+                                />
+                            </div>
+                            <div className="row wrap">
+                                <ManageBtn id="extend" label="Save End Time" variant="outline" onClick={onExtend} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                                <ManageBtn id="update_reward" label="Save Reward" variant="outline" onClick={onUpdateReward} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                            </div>
+                        </Section>
+
+                        <Section title="Whitelist" tag="optional">
+                            <Field
+                                label="Addresses"
+                                textarea
+                                rows={3}
+                                value={form.whitelistAddrs}
+                                onChange={(e) => onChange({ whitelistAddrs: e.target.value })}
+                                hint="Comma or newline separated. Each must be a valid G... Stellar address."
+                            />
+                            <div className="row wrap">
+                                <ManageBtn id="enable_wl" label="Enable Whitelist" variant="outline" onClick={onEnableWhitelist} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                                <ManageBtn id="add_wl" label="Add Addresses" onClick={onAddWhitelist} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                            </div>
+                        </Section>
+
+                        <Section title="Questions" tag={`${survey.question_count} on-chain`}>
+                            <ol className="questions-list">
+                                {survey.questions.map((q, i) => (
+                                    <li key={i}><span className="q-num">Q{i + 1}</span><span>{q}</span></li>
+                                ))}
+                            </ol>
+                            <p className="hint">Questions are immutable once published.</p>
+                        </Section>
+
+                        <ResponsesSection
+                            survey={survey}
+                            responses={responses}
+                            onReload={onReloadResponses}
+                            onTip={(addr) => onTip(addr, survey.id)}
+                            wallet={wallet}
+                        />
+                    </>
+                ) : (
+                    <div className="empty-state inset">
+                        <span className="empty-icon">←</span>
+                        <h3>Select a survey</h3>
+                        <p>Pick one from the list to edit, share, or view responses.</p>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function ResponsesSection({ survey, responses, onReload, onTip, wallet }) {
+    return (
+        <Section title="Responses" tag={`${responses ? responses.length : "—"} total`}>
+            <div className="row" style={{ marginBottom: "0.75rem" }}>
+                <button type="button" className="btn btn-outline btn-sm" onClick={onReload}>Reload</button>
+            </div>
+
+            {!responses && <p className="hint">Loading responses…</p>}
+            {responses && responses.length === 0 && <p className="hint">No responses yet. Share the link to invite people.</p>}
+
+            {responses && responses.length > 0 && (
+                <div className="responses-stack">
+                    {responses.map((entry, idx) => {
+                        const isSelf = wallet?.publicKey === entry.respondent;
+                        return (
+                            <article key={`${entry.respondent}-${idx}`} className="response-card">
+                                <header className="response-head">
+                                    <div className="response-id">
+                                        <span className="response-num">#{idx + 1}</span>
+                                        <span className="mono small">{entry.respondent}</span>
+                                    </div>
+                                    <div className="response-meta">
+                                        <span className="hint">{formatUnix(entry.submitted_at)}</span>
+                                        {!isSelf && (
+                                            <button type="button" className="btn btn-xs btn-primary" onClick={() => onTip(entry.respondent)}>
+                                                Tip XLM
+                                            </button>
+                                        )}
+                                    </div>
+                                </header>
+                                <ol className="qa-list">
+                                    {survey.questions.map((q, qi) => (
+                                        <li key={qi} className="qa-item">
+                                            <span className="qa-q"><span className="q-num">Q{qi + 1}</span> {q}</span>
+                                            <span className="qa-a">{entry.answers[qi] ?? <em>—</em>}</span>
+                                        </li>
+                                    ))}
+                                </ol>
+                            </article>
+                        );
+                    })}
+                </div>
+            )}
+        </Section>
+    );
+}
+
+// ---------- Respond ----------
+function RespondPanel({ wallet, available, allSurveys, selectedId, survey, answers, onSelect, onSetAnswer, onSubmit, onConnect, onShare, connecting, submitting, disabled }) {
+    const surveyForView = survey || (selectedId ? allSurveys[selectedId] : null);
+    return (
+        <div className="respond-grid">
+            <aside className="respond-list card">
+                <div className="panel-head">
+                    <h2>Available</h2>
+                    <span className="panel-tag">{available.length}</span>
+                </div>
+                {available.length === 0 ? (
+                    <p className="hint">No active surveys at the moment.</p>
+                ) : (
+                    <ul className="manage-list-ul">
+                        {available.map((s) => (
+                            <li key={s.id}>
+                                <button
+                                    type="button"
+                                    className={`manage-list-item ${selectedId === s.id ? "is-active" : ""}`}
+                                    onClick={() => onSelect(s.id)}
+                                >
+                                    <div className="manage-list-top">
+                                        <span className="survey-id-tag">{s.id}</span>
+                                        <StatusPill status={s.status} />
+                                    </div>
+                                    <span className="manage-list-title">{s.title}</span>
+                                    <span className="manage-list-meta">
+                                        {s.question_count} question{s.question_count === 1 ? "" : "s"} · ends {formatRelative(s.end_time)}
+                                    </span>
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                )}
+            </aside>
+
+            <div className="respond-detail">
+                {!surveyForView ? (
+                    <div className="empty-state inset">
+                        <span className="empty-icon">←</span>
+                        <h3>Pick a survey</h3>
+                        <p>Choose one from the list to start answering.</p>
+                    </div>
+                ) : (
+                    <>
+                        <Section title={surveyForView.title} tag={surveyForView.id}>
+                            <div className="manage-summary">
+                                <StatusPill status={surveyForView.status} />
+                                <Stat label="Reward" value={`${stroopsToXlm(surveyForView.reward_per_response)} XLM`} />
+                                <Stat label="Closes" value={formatUnix(surveyForView.end_time)} small />
+                                <Stat label="Responses" value={`${surveyForView.response_count}${surveyForView.max_responses ? ` / ${surveyForView.max_responses}` : ""}`} />
+                            </div>
+                            <p className="manage-desc">{surveyForView.description || <em>No description provided.</em>}</p>
+                            <div className="row wrap">
+                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => onShare(surveyForView.id)}>↗ Copy Share Link</button>
+                            </div>
+                        </Section>
+
+                        {!wallet ? (
+                            <Section title="Connect to Respond" tag="wallet required">
+                                <div className="connect-cta">
+                                    <p>You're viewing <strong>{surveyForView.title}</strong>. Connect Freighter to submit your answers — your wallet address acts as your signature.</p>
+                                    <button
+                                        type="button"
+                                        className={`btn btn-primary btn-lg ${connecting ? "is-loading" : ""}`}
+                                        onClick={onConnect}
+                                        disabled={disabled}
+                                    >
+                                        Connect Freighter
+                                    </button>
+                                </div>
+                            </Section>
+                        ) : (
+                            <Section title="Your Response" tag="submit_response">
+                                <div className="answers-stack">
+                                    {surveyForView.questions.map((q, i) => (
+                                        <div className="answer-row" key={i}>
+                                            <label><span className="q-num">Q{i + 1}</span> {q}</label>
+                                            <textarea
+                                                rows={2}
+                                                value={answers[i] || ""}
+                                                onChange={(e) => onSetAnswer(i, e.target.value)}
+                                                placeholder="Your answer…"
+                                            />
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="row">
+                                    <button
+                                        type="button"
+                                        className={`btn btn-primary ${submitting ? "is-loading" : ""}`}
+                                        onClick={onSubmit}
+                                        disabled={disabled}
+                                    >
+                                        Submit Response
+                                    </button>
+                                </div>
+                            </Section>
+                        )}
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// ---------- Explore ----------
+function ExplorePanel({ ids, surveys, responses, loading, onRefresh, onExpand, onCollapse, onRespond, onManage, onShare, onTip, onLoadResponses, wallet, expanded }) {
     return (
         <div className="explore">
             <div className="explore-head">
                 <div>
                     <h2>All Surveys</h2>
-                    <p>Click any survey to expand details, share, or respond.</p>
+                    <p>Click any survey to expand. Tap Share to copy a public link.</p>
                 </div>
                 <button type="button" className="btn btn-outline btn-sm" onClick={onRefresh} disabled={loading}>
                     {loading ? "Loading…" : "Refresh"}
@@ -839,31 +1343,28 @@ function ExplorePanel({ ids, surveys, participants, loading, onRefresh, onView, 
                 <div className="empty-state">
                     <span className="empty-icon">∅</span>
                     <h3>No surveys yet</h3>
-                    <p>Be the first to publish — head to <strong>01 / Create</strong>.</p>
+                    <p>Be the first — head to <strong>01 / Create</strong>.</p>
                 </div>
             )}
 
             <div className="survey-grid">
                 {ids.map((id) => {
                     const s = surveys[id];
-                    const isSelected = selected === id;
-                    const parts = participants[id];
+                    const isExpanded = expanded === id;
+                    const list = responses[id];
                     const isCreator = wallet && s && s.creator === wallet.publicKey;
 
                     return (
-                        <article key={id} className={`survey-card ${isSelected ? "is-selected" : ""}`}>
-                            <header className="survey-card-head">
-                                <div className="survey-id">
-                                    <span className="survey-id-tag">{id}</span>
-                                    {s && <span className={`status-pill pill-${(s.status || "").toLowerCase()}`}>{s.status}</span>}
-                                </div>
-                                <div className="survey-actions-mini">
-                                    <button type="button" className="icon-btn" title="Share" onClick={() => onShare(id)}>↗</button>
-                                </div>
-                            </header>
-
+                        <article key={id} className={`survey-card ${isExpanded ? "is-selected" : ""}`}>
                             {s ? (
                                 <>
+                                    <header className="survey-card-head">
+                                        <div className="survey-id">
+                                            <span className="survey-id-tag">{id}</span>
+                                            <StatusPill status={s.status} />
+                                        </div>
+                                        <button type="button" className="icon-btn" title="Share" onClick={() => onShare(id)}>↗</button>
+                                    </header>
                                     <h3 className="survey-title">{s.title}</h3>
                                     <p className="survey-desc">{s.description || "No description"}</p>
 
@@ -871,42 +1372,57 @@ function ExplorePanel({ ids, surveys, participants, loading, onRefresh, onView, 
                                         <Stat label="Responses" value={`${s.response_count}${s.max_responses ? ` / ${s.max_responses}` : ""}`} />
                                         <Stat label="Questions" value={s.question_count} />
                                         <Stat label="Reward" value={`${stroopsToXlm(s.reward_per_response)} XLM`} />
-                                        <Stat label="Ends" value={formatTime(s.end_time)} small />
+                                        <Stat label="Ends" value={formatRelative(s.end_time)} small />
                                     </div>
 
                                     <div className="survey-actions">
                                         <button type="button" className="btn btn-sm btn-primary" onClick={() => onRespond(id)}>Respond</button>
-                                        <button type="button" className="btn btn-sm btn-outline" onClick={() => onShare(id)}>Share</button>
                                         {isCreator && (
-                                            <button type="button" className="btn btn-sm btn-ghost" onClick={() => onManage(id)}>Manage</button>
+                                            <button type="button" className="btn btn-sm btn-outline" onClick={() => onManage(id)}>Manage</button>
                                         )}
-                                        <button type="button" className="btn btn-sm btn-ghost" onClick={() => onView(id)}>
-                                            {isSelected ? "Hide" : "Participants"}
+                                        <button
+                                            type="button"
+                                            className="btn btn-sm btn-ghost"
+                                            onClick={() => isExpanded ? onCollapse() : onExpand(id)}
+                                        >
+                                            {isExpanded ? "Hide" : "Details"}
                                         </button>
                                     </div>
 
-                                    {isSelected && (
-                                        <div className="participants">
-                                            <div className="participants-head">
-                                                <strong>Participants</strong>
-                                                <button type="button" className="link-btn" onClick={() => onLoadParticipants(id)}>Reload</button>
+                                    {isExpanded && (
+                                        <div className="survey-expanded">
+                                            <div className="survey-meta-row">
+                                                <span className="meta-label">Closes</span>
+                                                <span className="meta-value small">{formatUnix(s.end_time)}</span>
                                             </div>
-                                            {!parts && <span className="hint">Loading…</span>}
-                                            {parts && parts.length === 0 && <span className="hint">No responses yet.</span>}
-                                            {parts && parts.length > 0 && (
-                                                <ul className="participant-list">
-                                                    {parts.map((p, idx) => (
-                                                        <li key={`${p}-${idx}`}>
-                                                            <span className="mono small">{truncate(p, 8, 8)}</span>
-                                                            {wallet?.publicKey && wallet.publicKey !== p && (
-                                                                <button type="button" className="btn btn-xs btn-primary" onClick={() => onTip(p, id)}>
-                                                                    Tip
-                                                                </button>
-                                                            )}
-                                                        </li>
-                                                    ))}
-                                                </ul>
-                                            )}
+                                            <div className="survey-meta-row">
+                                                <span className="meta-label">Creator</span>
+                                                <span className="mono small">{truncate(s.creator, 8, 8)}</span>
+                                            </div>
+
+                                            <div className="participants">
+                                                <div className="participants-head">
+                                                    <strong>Responses</strong>
+                                                    <button type="button" className="link-btn" onClick={() => onLoadResponses(id)}>Reload</button>
+                                                </div>
+                                                {!list && <span className="hint">Click Reload to fetch responses.</span>}
+                                                {list && list.length === 0 && <span className="hint">No responses yet.</span>}
+                                                {list && list.length > 0 && (
+                                                    <ul className="participant-list">
+                                                        {list.map((entry, idx) => (
+                                                            <li key={`${entry.respondent}-${idx}`}>
+                                                                <span className="mono small">{truncate(entry.respondent, 8, 8)}</span>
+                                                                <span className="hint">{formatUnix(entry.submitted_at)}</span>
+                                                                {wallet?.publicKey && wallet.publicKey !== entry.respondent && (
+                                                                    <button type="button" className="btn btn-xs btn-primary" onClick={() => onTip(entry.respondent, id)}>
+                                                                        Tip
+                                                                    </button>
+                                                                )}
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                )}
+                                            </div>
                                         </div>
                                     )}
                                 </>
@@ -924,30 +1440,21 @@ function ExplorePanel({ ids, surveys, participants, loading, onRefresh, onView, 
     );
 }
 
-function Stat({ label, value, small }) {
-    return (
-        <div className="meta-stat">
-            <span className="meta-label">{label}</span>
-            <span className={`meta-value ${small ? "small" : ""}`}>{value}</span>
-        </div>
-    );
-}
-
-function ResultPanel({ result, onTip }) {
+// ---------- Result ----------
+function ResultPanel({ result }) {
     if (result.kind === "idle") return null;
-
     return (
         <section className={`card result result-${result.kind}`}>
             <div className="panel-head">
                 <h2>{result.title || "Result"}</h2>
                 <span className={`panel-tag tag-${result.kind}`}>{result.kind}</span>
             </div>
-            <ResultBody body={result.body} onTip={onTip} />
+            <ResultBody body={result.body} />
         </section>
     );
 }
 
-function ResultBody({ body, onTip }) {
+function ResultBody({ body }) {
     if (body == null) return <p className="result-empty">No data.</p>;
     if (typeof body === "string") return <p className="result-text">{body}</p>;
     if (typeof body !== "object" || !body.kind) return <pre className="result-pre">{JSON.stringify(body, null, 2)}</pre>;
@@ -988,29 +1495,13 @@ function ResultBody({ body, onTip }) {
                     <Stat label="Responses" value={`${s.response_count}${s.max_responses ? ` / ${s.max_responses}` : ""}`} />
                     <Stat label="Questions" value={s.question_count} />
                     <Stat label="Reward" value={`${stroopsToXlm(s.reward_per_response)} XLM`} />
-                    <Stat label="Created" value={formatTime(s.created_at)} small />
-                    <Stat label="Ends" value={formatTime(s.end_time)} small />
+                    <Stat label="Created" value={formatUnix(s.created_at)} small />
+                    <Stat label="Closes" value={formatUnix(s.end_time)} small />
                 </div>
                 <div className="creator-row">
                     <span className="meta-label">Creator</span>
                     <span className="mono small">{s.creator}</span>
                 </div>
-            </div>
-        );
-    }
-    if (body.kind === "participants") {
-        return (
-            <div className="result-participants">
-                <p>{body.list.length} participant{body.list.length === 1 ? "" : "s"} in <strong className="mono">{body.surveyId}</strong></p>
-                <ul className="participant-list">
-                    {body.list.map((p, i) => (
-                        <li key={`${p}-${i}`}>
-                            <span className="mono small">{p}</span>
-                            <button type="button" className="btn btn-xs btn-primary" onClick={() => onTip(p, body.surveyId)}>Tip</button>
-                        </li>
-                    ))}
-                    {body.list.length === 0 && <li className="hint">No responses yet.</li>}
-                </ul>
             </div>
         );
     }
@@ -1037,52 +1528,463 @@ function ResultBody({ body, onTip }) {
     if (body.kind === "create") {
         return (
             <div className="result-flat">
-                <p><strong>{body.title}</strong> published as <span className="mono">{body.id}</span>.</p>
-                {body.reward && Number(body.reward) > 0 && <p>Reward: {body.reward} XLM per response (informational)</p>}
+                <p><strong>{body.title}</strong> published as <span className="mono">{body.id}</span> with {body.count} question{body.count === 1 ? "" : "s"}.</p>
+                {body.reward && Number(body.reward) > 0 && <p>Reward: {body.reward} XLM per response (informational).</p>}
             </div>
         );
     }
     if (body.kind === "respond") {
         return (
             <div className="result-flat">
-                <p>Response submitted to <strong className="mono">{body.surveyId}</strong>.</p>
-                <p className="hint">Answers stored in tx args; participation recorded on-chain.</p>
+                <p>Response submitted to <strong className="mono">{body.surveyId}</strong>. Thanks!</p>
             </div>
         );
     }
     return <pre className="result-pre">{JSON.stringify(body, null, 2)}</pre>;
 }
 
-function TxDrawer({ transactions, onDismiss }) {
-    if (!transactions.length) return null;
+// ---------- Analytics ----------
+function AnalyticsPanel({ wallet, scope, onSetScope, mySurveys, allIds, surveys, responses, selectedId, onSelect, check, onSetCheck, loading, onCheckHasResponded, onShare, onTip, onReloadResponses, onRefresh, totalCount, busyAction, disabled }) {
+    const list = useMemo(() => {
+        if (scope === "mine") return mySurveys;
+        return allIds.map((id) => surveys[id]).filter(Boolean);
+    }, [scope, mySurveys, allIds, surveys]);
+
+    const selected = selectedId ? surveys[selectedId] : null;
+    const responseList = selectedId ? responses[selectedId] : null;
+
     return (
-        <div className="tx-drawer">
-            {transactions.map((tx) => (
-                <div key={tx.id} className={`tx-card tx-${tx.status}`}>
-                    <span className="tx-icon">
-                        {tx.status === "pending" && <span className="spinner" />}
-                        {tx.status === "success" && "✓"}
-                        {tx.status === "error" && "✗"}
-                    </span>
-                    <div className="tx-body">
-                        <span className="tx-label">{tx.label}</span>
-                        <span className="tx-meta">
-                            {tx.status === "pending" && "Awaiting network…"}
-                            {tx.status === "success" && (tx.hash ? (
-                                <a className="link-btn" href={`https://stellar.expert/explorer/testnet/tx/${tx.hash}`} target="_blank" rel="noreferrer">
-                                    View on stellar.expert ↗
-                                </a>
-                            ) : "Done")}
-                            {tx.status === "error" && (tx.error || "Failed")}
-                        </span>
-                    </div>
-                    <button type="button" className="tx-close" onClick={() => onDismiss(tx.id)}>×</button>
+        <div className="analytics-grid">
+            <aside className="analytics-list card">
+                <div className="panel-head">
+                    <h2>Surveys</h2>
+                    <button type="button" className="btn btn-outline btn-sm" onClick={onRefresh} disabled={disabled}>Refresh</button>
                 </div>
-            ))}
+                <div className="scope-tabs">
+                    <button
+                        type="button"
+                        className={`scope-tab ${scope === "mine" ? "scope-active" : ""}`}
+                        onClick={() => onSetScope("mine")}
+                        disabled={!wallet}
+                    >
+                        My Surveys{wallet && ` (${mySurveys.length})`}
+                    </button>
+                    <button
+                        type="button"
+                        className={`scope-tab ${scope === "all" ? "scope-active" : ""}`}
+                        onClick={() => onSetScope("all")}
+                    >
+                        All ({allIds.length})
+                    </button>
+                </div>
+
+                {!wallet && scope === "mine" ? (
+                    <p className="hint">Connect Freighter to see surveys you've created.</p>
+                ) : list.length === 0 ? (
+                    <p className="hint">No surveys to show.</p>
+                ) : (
+                    <ul className="manage-list-ul">
+                        {list.map((s) => (
+                            <li key={s.id}>
+                                <button
+                                    type="button"
+                                    className={`manage-list-item ${selectedId === s.id ? "is-active" : ""}`}
+                                    onClick={() => onSelect(s.id)}
+                                >
+                                    <div className="manage-list-top">
+                                        <span className="survey-id-tag">{s.id}</span>
+                                        <StatusPill status={s.status} />
+                                    </div>
+                                    <span className="manage-list-title">{s.title}</span>
+                                    <span className="manage-list-meta">
+                                        {s.response_count} responses · ends {formatRelative(s.end_time)}
+                                    </span>
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                )}
+
+                <div className="analytics-global-stat">
+                    <span className="meta-label">Total on-chain</span>
+                    <span className="meta-value">{totalCount ?? "—"}</span>
+                </div>
+            </aside>
+
+            <div className="analytics-detail">
+                {!selected ? (
+                    <div className="empty-state inset">
+                        <span className="empty-icon">←</span>
+                        <h3>Pick a survey</h3>
+                        <p>Select a survey from the list to load its full analytics.</p>
+                    </div>
+                ) : (
+                    <>
+                        <Section title={selected.title} tag={selected.id}>
+                            <div className="manage-summary">
+                                <StatusPill status={selected.status} />
+                                <Stat label="Responses" value={`${selected.response_count}${selected.max_responses ? ` / ${selected.max_responses}` : ""}`} />
+                                <Stat label="Questions" value={selected.question_count} />
+                                <Stat label="Reward" value={`${stroopsToXlm(selected.reward_per_response)} XLM`} />
+                                <Stat label="Created" value={formatUnix(selected.created_at)} small />
+                                <Stat label="Closes" value={`${formatUnix(selected.end_time)} · ${formatRelative(selected.end_time)}`} small />
+                            </div>
+                            <p className="manage-desc">{selected.description || <em>No description</em>}</p>
+                            <div className="row wrap">
+                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => onShare(selected.id)}>↗ Share Link</button>
+                                <button type="button" className="btn btn-outline btn-sm" onClick={onReloadResponses}>Reload Responses</button>
+                            </div>
+                        </Section>
+
+                        <div className="analytics-stats-row">
+                            <div className={`big-card ${check.accepting === true ? "big-on" : check.accepting === false ? "big-off" : "big-neutral"}`}>
+                                <span className="big-stat-label">Accepting Responses</span>
+                                <span className="big-stat-value">
+                                    {check.accepting === null ? "—" : check.accepting ? "Yes" : "No"}
+                                </span>
+                                <span className="hint">
+                                    {check.accepting === true && "Active and within window"}
+                                    {check.accepting === false && "Closed, paused, expired or full"}
+                                </span>
+                            </div>
+                            <div className="big-card big-neutral">
+                                <span className="big-stat-label">Response Count</span>
+                                <span className="big-stat-value">{selected.response_count}</span>
+                                {selected.max_responses > 0 && (
+                                    <div className="progress-wrap">
+                                        <div
+                                            className="progress-fill"
+                                            style={{ width: `${Math.min(100, (selected.response_count / selected.max_responses) * 100)}%` }}
+                                        />
+                                    </div>
+                                )}
+                            </div>
+                            <div className="big-card big-neutral">
+                                <span className="big-stat-label">Questions</span>
+                                <span className="big-stat-value">{selected.question_count}</span>
+                                <span className="hint">Total questions on-chain</span>
+                            </div>
+                        </div>
+
+                        <Section title="Has Responded?" tag="dedup_check">
+                            <p className="hint" style={{ marginBottom: "0.6rem" }}>
+                                Check whether a specific address has already submitted a response to this survey.
+                            </p>
+                            <div className="grid-2">
+                                <Field
+                                    label="Address"
+                                    value={check.respondent}
+                                    onChange={(e) => onSetCheck((prev) => ({ ...prev, respondent: e.target.value }))}
+                                    placeholder={wallet ? "Defaults to your connected wallet" : "G..."}
+                                />
+                            </div>
+                            <div className="row wrap">
+                                <button
+                                    type="button"
+                                    className={`btn btn-outline ${busyAction === "hasResp" ? "is-loading" : ""}`}
+                                    onClick={() => onCheckHasResponded()}
+                                    disabled={disabled}
+                                >
+                                    Check
+                                </button>
+                                {wallet && (
+                                    <button
+                                        type="button"
+                                        className="btn btn-ghost"
+                                        onClick={() => onCheckHasResponded(wallet.publicKey)}
+                                        disabled={disabled}
+                                    >
+                                        Check Me
+                                    </button>
+                                )}
+                            </div>
+                            {check.hasResponded != null && (
+                                <div className={`bool-stat ${check.hasResponded ? "bool-yes" : "bool-no"}`} style={{ marginTop: "0.85rem" }}>
+                                    <span className="bool-icon">{check.hasResponded ? "✓" : "✗"}</span>
+                                    <span className="bool-label">{truncate(check.respondent, 8, 8)}</span>
+                                    <span className="bool-value">{check.hasResponded ? "Already responded" : "Not yet"}</span>
+                                </div>
+                            )}
+                        </Section>
+
+                        <Section title="Questions" tag={`${selected.question_count} total`}>
+                            <ol className="questions-list">
+                                {selected.questions.map((q, i) => (
+                                    <li key={i}><span className="q-num">Q{i + 1}</span><span>{q}</span></li>
+                                ))}
+                            </ol>
+                        </Section>
+
+                        <Section title="All Responses" tag={`${responseList ? responseList.length : "—"} entries`}>
+                            {loading && <p className="hint">Loading…</p>}
+                            {!loading && (!responseList || responseList.length === 0) && (
+                                <p className="hint">No responses yet. Share the link to invite people.</p>
+                            )}
+                            {responseList && responseList.length > 0 && (
+                                <div className="responses-stack">
+                                    {responseList.map((entry, idx) => {
+                                        const isSelf = wallet?.publicKey === entry.respondent;
+                                        return (
+                                            <article key={`${entry.respondent}-${idx}`} className="response-card">
+                                                <header className="response-head">
+                                                    <div className="response-id">
+                                                        <span className="response-num">#{idx + 1}</span>
+                                                        <span className="mono small">{entry.respondent}</span>
+                                                    </div>
+                                                    <div className="response-meta">
+                                                        <span className="hint">{formatUnix(entry.submitted_at)}</span>
+                                                        {!isSelf && wallet && (
+                                                            <button type="button" className="btn btn-xs btn-primary" onClick={() => onTip(entry.respondent, selected.id)}>
+                                                                Tip XLM
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </header>
+                                                <ol className="qa-list">
+                                                    {selected.questions.map((q, qi) => (
+                                                        <li key={qi} className="qa-item">
+                                                            <span className="qa-q"><span className="q-num">Q{qi + 1}</span> {q}</span>
+                                                            <span className="qa-a">{entry.answers[qi] ?? <em>—</em>}</span>
+                                                        </li>
+                                                    ))}
+                                                </ol>
+                                            </article>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </Section>
+                    </>
+                )}
+            </div>
         </div>
     );
 }
 
+// ---------- Tx Drawer ----------
+function TxDrawer({ transactions, onDismiss, onClearAll }) {
+    if (!transactions.length) return null;
+    const pending = transactions.filter((t) => t.status === "pending").length;
+    return (
+        <div className="tx-drawer">
+            <div className="tx-drawer-head">
+                <div className="tx-drawer-title">
+                    <span className="tx-drawer-dot" />
+                    <span>Activity</span>
+                    <span className="tx-drawer-count">
+                        {pending > 0 ? `${pending} pending` : `${transactions.length} item${transactions.length === 1 ? "" : "s"}`}
+                    </span>
+                </div>
+                <button type="button" className="tx-clear-all" onClick={onClearAll}>Clear</button>
+            </div>
+            <div className="tx-drawer-body">
+                {transactions.map((tx) => (
+                    <div key={tx.id} className={`tx-card tx-${tx.status}`}>
+                        <span className="tx-icon">
+                            {tx.status === "pending" && <span className="spinner" />}
+                            {tx.status === "success" && "✓"}
+                            {tx.status === "error" && "✗"}
+                        </span>
+                        <div className="tx-body">
+                            <span className="tx-label">{tx.label}</span>
+                            <span className="tx-meta">
+                                {tx.status === "pending" && "Awaiting network…"}
+                                {tx.status === "success" && (tx.hash ? (
+                                    <a className="link-btn" href={`https://stellar.expert/explorer/testnet/tx/${tx.hash}`} target="_blank" rel="noreferrer">
+                                        View on stellar.expert ↗
+                                    </a>
+                                ) : "Done")}
+                                {tx.status === "error" && (tx.error || "Failed")}
+                            </span>
+                        </div>
+                        <button type="button" className="tx-close" onClick={() => onDismiss(tx.id)}>×</button>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+// ---------- Shared Respond Page (public link landing) ----------
+function SharedRespondPage({ state, surveyId, wallet, answers, onSetAnswer, onConnect, onDisconnect, onSubmit, onExit, connecting, submitting, disabled }) {
+    const { loading, survey, hasResponded: alreadyResponded, submitted } = state;
+    const flags = useMemo(() => {
+        if (!survey) return { expired: false, closed: false, full: false, blocking: false };
+        const expired = survey.end_time < nowTs();
+        const closed = survey.status !== "Active";
+        const full = survey.max_responses > 0 && survey.response_count >= survey.max_responses;
+        return { expired, closed, full, blocking: expired || closed || full };
+    }, [survey]);
+    const { expired, closed, full, blocking } = flags;
+    const canRespond = wallet && !alreadyResponded && !blocking && !submitted;
+
+    return (
+        <div className="shared-page">
+            <div className="grain" aria-hidden="true" />
+
+            <header className="shared-header">
+                <button type="button" className="shared-brand" onClick={onExit} title="Open Survey Builder">
+                    <span className="brand-mark">SB</span>
+                    <span className="brand-text">
+                        <strong>Survey Builder</strong>
+                        <span>Soroban · Testnet</span>
+                    </span>
+                </button>
+
+                <div className="shared-header-right">
+                    {wallet ? (
+                        <>
+                            <span className="pill pill-on">
+                                <span className="pill-dot" />
+                                {wallet.publicKey.slice(0, 6)}…{wallet.publicKey.slice(-4)}
+                            </span>
+                            <button type="button" className="btn btn-ghost btn-sm" onClick={onDisconnect} disabled={disabled}>Disconnect</button>
+                        </>
+                    ) : (
+                        <button
+                            type="button"
+                            className={`btn btn-primary btn-sm ${connecting ? "is-loading" : ""}`}
+                            onClick={onConnect}
+                            disabled={disabled}
+                        >
+                            Connect Freighter
+                        </button>
+                    )}
+                </div>
+            </header>
+
+            <main className="shared-main">
+                {loading && (
+                    <div className="shared-card empty-state">
+                        <div className="loader-row">
+                            <span className="loader-dot" />
+                            <span className="loader-dot" />
+                            <span className="loader-dot" />
+                        </div>
+                        <p>Loading survey…</p>
+                    </div>
+                )}
+
+                {!loading && !survey && (
+                    <div className="shared-card empty-state">
+                        <span className="empty-icon">∅</span>
+                        <h3>Survey not found</h3>
+                        <p>The survey <span className="mono small">{surveyId}</span> doesn't exist on this contract — the link may be incorrect or for a different deployment.</p>
+                        <button type="button" className="btn btn-outline" onClick={onExit}>Browse all surveys</button>
+                    </div>
+                )}
+
+                {survey && (
+                    <article className="shared-card">
+                        <span className="shared-tag">SURVEY · {survey.id}</span>
+                        <h1 className="shared-title">{survey.title}</h1>
+                        {survey.description && <p className="shared-desc">{survey.description}</p>}
+
+                        <div className="shared-meta">
+                            <Stat label="Questions" value={survey.question_count} />
+                            <Stat label="Responses" value={`${survey.response_count}${survey.max_responses ? ` / ${survey.max_responses}` : ""}`} />
+                            <Stat label="Reward" value={`${stroopsToXlm(survey.reward_per_response)} XLM`} />
+                            <Stat label="Closes" value={`${formatUnix(survey.end_time)}`} small />
+                        </div>
+
+                        {submitted && (
+                            <div className="shared-success">
+                                <span className="shared-success-icon">✓</span>
+                                <h2>Thanks for your response!</h2>
+                                <p>Your answers were recorded on-chain. The creator can now view your submission and may send a reward.</p>
+                                <button type="button" className="btn btn-outline" onClick={onExit}>Browse other surveys</button>
+                            </div>
+                        )}
+
+                        {!submitted && blocking && (
+                            <div className="shared-blocking">
+                                <span className="shared-blocking-icon">⛔</span>
+                                <h2>
+                                    {expired && "This survey has ended"}
+                                    {!expired && full && "Response cap reached"}
+                                    {!expired && !full && closed && `This survey is ${survey.status.toLowerCase()}`}
+                                </h2>
+                                <p>Responses are no longer being accepted. Reach out to the creator if you think this is a mistake.</p>
+                                <button type="button" className="btn btn-outline" onClick={onExit}>Browse other surveys</button>
+                            </div>
+                        )}
+
+                        {!submitted && !blocking && !wallet && (
+                            <div className="shared-cta">
+                                <span className="shared-cta-eyebrow">Step 1 of 2</span>
+                                <h2>Connect your wallet to respond</h2>
+                                <p>Your wallet address signs your submission. We never store your secret key — Freighter does the signing locally.</p>
+                                <button
+                                    type="button"
+                                    className={`btn btn-primary btn-lg ${connecting ? "is-loading" : ""}`}
+                                    onClick={onConnect}
+                                    disabled={disabled}
+                                >
+                                    Connect Freighter
+                                </button>
+                                <p className="hint" style={{ marginTop: "0.85rem" }}>
+                                    Don't have Freighter? <a href="https://www.freighter.app/" target="_blank" rel="noreferrer" className="link-btn">Install it ↗</a>
+                                </p>
+                            </div>
+                        )}
+
+                        {!submitted && !blocking && wallet && alreadyResponded && (
+                            <div className="shared-already">
+                                <span className="shared-success-icon">✓</span>
+                                <h2>You've already responded</h2>
+                                <p>The contract has your previous response on file. Each address can submit only once per survey.</p>
+                                <button type="button" className="btn btn-outline" onClick={onExit}>Browse other surveys</button>
+                            </div>
+                        )}
+
+                        {canRespond && (
+                            <div className="shared-form">
+                                <div className="shared-form-head">
+                                    <span className="shared-cta-eyebrow">Step 2 of 2</span>
+                                    <h2>Your Answers</h2>
+                                </div>
+
+                                <div className="answers-stack">
+                                    {survey.questions.map((q, i) => (
+                                        <div className="answer-row" key={i}>
+                                            <label><span className="q-num">Q{i + 1}</span> {q}</label>
+                                            <textarea
+                                                rows={2}
+                                                value={answers[i] || ""}
+                                                onChange={(e) => onSetAnswer(i, e.target.value)}
+                                                placeholder="Your answer…"
+                                            />
+                                        </div>
+                                    ))}
+                                </div>
+
+                                <div className="shared-form-foot">
+                                    <button
+                                        type="button"
+                                        className={`btn btn-primary btn-lg ${submitting ? "is-loading" : ""}`}
+                                        onClick={onSubmit}
+                                        disabled={disabled}
+                                    >
+                                        Submit Response
+                                    </button>
+                                    <span className="hint">
+                                        Submitting signs a Soroban transaction with your wallet. Network fees are paid in XLM.
+                                    </span>
+                                </div>
+                            </div>
+                        )}
+                    </article>
+                )}
+
+                <div className="shared-foot">
+                    <button type="button" className="link-btn" onClick={onExit}>← Open the full Survey Builder app</button>
+                </div>
+            </main>
+        </div>
+    );
+}
+
+// ---------- Payment Modal ----------
 function PaymentModal({ state, onChange, onClose, onSubmit, busy }) {
     return (
         <div className="modal-backdrop" onClick={onClose}>

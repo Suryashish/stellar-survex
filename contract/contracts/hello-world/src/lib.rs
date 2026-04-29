@@ -14,15 +14,23 @@ pub struct Survey {
     pub creator: Address,
     pub title: String,
     pub description: String,
-    pub question_count: u32,
+    pub questions: Vec<String>,
     pub response_count: u32,
     pub status: SurveyStatus,
     pub created_at: u64,
     pub end_time: u64,
     pub max_responses: u32,
-    /// Informational reward per response in stroops (1 XLM = 10_000_000 stroops).
-    /// Payment itself is settled off-contract via direct payment from the creator.
+    /// Informational reward per response in stroops (1 XLM = 10_000_000).
+    /// Payment is settled off-contract via direct payment from the creator.
     pub reward_per_response: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ResponseEntry {
+    pub respondent: Address,
+    pub answers: String,
+    pub submitted_at: u64,
 }
 
 #[contracttype]
@@ -39,10 +47,12 @@ pub enum DataKey {
     IdList,
     TotalCount,
     Survey(Symbol),
+    /// Dedup flag — exists if the address has already responded.
     Response(Symbol, Address),
+    /// Ordered list of full response entries for retrieval.
+    Responses(Symbol),
     Whitelist(Symbol),
     WhitelistEnabled(Symbol),
-    Participants(Symbol),
 }
 
 // --- Errors ---
@@ -62,6 +72,7 @@ pub enum ContractError {
     InvalidEndTime    = 9,
     AlreadyExists     = 10,
     InvalidReward     = 11,
+    InvalidQuestions  = 12,
 }
 
 // --- Contract ---
@@ -71,8 +82,6 @@ pub struct SurveyBuilderContract;
 
 #[contractimpl]
 impl SurveyBuilderContract {
-
-    // -- Internal helpers --
 
     fn load_survey(env: &Env, id: &Symbol) -> Survey {
         env.storage()
@@ -112,7 +121,7 @@ impl SurveyBuilderContract {
         creator: Address,
         title: String,
         description: String,
-        question_count: u32,
+        questions: Vec<String>,
         end_time: u64,
         max_responses: u32,
         reward_per_response: i128,
@@ -121,6 +130,9 @@ impl SurveyBuilderContract {
 
         if title.len() == 0 {
             panic_with_error!(&env, ContractError::InvalidTitle);
+        }
+        if questions.len() == 0 {
+            panic_with_error!(&env, ContractError::InvalidQuestions);
         }
         if reward_per_response < 0 {
             panic_with_error!(&env, ContractError::InvalidReward);
@@ -141,7 +153,7 @@ impl SurveyBuilderContract {
             creator,
             title,
             description,
-            question_count,
+            questions,
             response_count: 0,
             status: SurveyStatus::Active,
             created_at: now,
@@ -158,7 +170,7 @@ impl SurveyBuilderContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::Participants(id), &Vec::<Address>::new(&env));
+            .set(&DataKey::Responses(id), &Vec::<ResponseEntry>::new(&env));
 
         let count: u32 = env
             .storage()
@@ -271,7 +283,6 @@ impl SurveyBuilderContract {
         answers: String,
     ) {
         respondent.require_auth();
-        let _ = answers;
 
         let mut survey = Self::load_survey(&env, &survey_id);
 
@@ -315,14 +326,19 @@ impl SurveyBuilderContract {
         env.storage().instance().set(&resp_key, &true);
         survey.response_count += 1;
 
-        let part_key = DataKey::Participants(survey_id.clone());
-        let mut participants: Vec<Address> = env
+        let entries_key = DataKey::Responses(survey_id.clone());
+        let mut entries: Vec<ResponseEntry> = env
             .storage()
             .instance()
-            .get(&part_key)
+            .get(&entries_key)
             .unwrap_or(Vec::new(&env));
-        participants.push_back(respondent);
-        env.storage().instance().set(&part_key, &participants);
+
+        entries.push_back(ResponseEntry {
+            respondent,
+            answers,
+            submitted_at: now,
+        });
+        env.storage().instance().set(&entries_key, &entries);
 
         if survey.max_responses > 0 && survey.response_count >= survey.max_responses {
             survey.status = SurveyStatus::Closed;
@@ -382,10 +398,10 @@ impl SurveyBuilderContract {
         }
     }
 
-    pub fn get_participants(env: Env, survey_id: Symbol) -> Vec<Address> {
+    pub fn get_responses(env: Env, survey_id: Symbol) -> Vec<ResponseEntry> {
         env.storage()
             .instance()
-            .get(&DataKey::Participants(survey_id))
+            .get(&DataKey::Responses(survey_id))
             .unwrap_or(Vec::new(&env))
     }
 }
