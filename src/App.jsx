@@ -11,7 +11,7 @@ import {
     resumeSurvey,
     closeSurvey,
     extendSurvey,
-    updateReward,
+    withdrawUnusedFunds,
     enableWhitelist,
     addToWhitelist,
     submitResponse,
@@ -63,6 +63,10 @@ const normalizeSurvey = (raw) => {
         reward_per_response: typeof raw.reward_per_response === "bigint"
             ? raw.reward_per_response
             : BigInt(raw.reward_per_response || 0),
+        funded_remaining: typeof raw.funded_remaining === "bigint"
+            ? raw.funded_remaining
+            : BigInt(raw.funded_remaining || 0),
+        reward_token: raw.reward_token,
     };
 };
 
@@ -81,8 +85,7 @@ const NAV = [
     { key: "explore", num: "00", label: "Explore" },
     { key: "create", num: "01", label: "Create" },
     { key: "manage", num: "02", label: "Manage" },
-    { key: "respond", num: "03", label: "Respond" },
-    { key: "analytics", num: "04", label: "Analytics" },
+    { key: "analytics", num: "03", label: "Analytics" },
 ];
 
 const newTxId = () => `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -113,7 +116,6 @@ export default function App() {
     const [activeNav, setActiveNav] = useState("explore");
     const [busyAction, setBusyAction] = useState(null);
     const [transactions, setTransactions] = useState([]);
-    const [result, setResult] = useState({ kind: "idle", title: "", body: null });
     const [totalCount, setTotalCount] = useState(null);
     const [confirmKey, setConfirmKey] = useState(null);
     const confirmTimer = useRef(null);
@@ -178,6 +180,14 @@ export default function App() {
 
     const dismissTx = (id) => setTransactions((prev) => prev.filter((t) => t.id !== id));
 
+    const notifyError = useCallback((label, error) => {
+        const id = newTxId();
+        setTransactions((prev) => [
+            { id, label, status: "error", error, startedAt: Date.now() },
+            ...prev.slice(0, 7),
+        ]);
+    }, []);
+
     const refreshTotal = useCallback(async () => {
         try {
             const value = await getTotalCount();
@@ -205,10 +215,11 @@ export default function App() {
             }));
             setSurveysById(fetched);
         } catch (error) {
-            setResult({ kind: "error", title: "Failed to load surveys", body: error.message });
+            notifyError("Failed to load surveys", error.message);
         } finally {
             setExploreLoading(false);
         }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const refreshResponses = useCallback(async (id) => {
@@ -307,7 +318,6 @@ export default function App() {
         } catch (error) {
             const message = error?.message || String(error);
             updateTx(txId, { status: "error", error: message });
-            setResult({ kind: "error", title: `Error · ${label}`, body: message });
         } finally {
             setBusyAction(null);
         }
@@ -336,7 +346,6 @@ export default function App() {
         await disconnectWallet();
         setWallet(null);
         setNetwork("");
-        setResult({ kind: "info", title: "Wallet disconnected", body: "Connect again to perform transactions." });
     };
 
     // ---- create ----
@@ -361,12 +370,18 @@ export default function App() {
         if (!requireWallet()) return;
         const trimmedQuestions = createForm.questions.map((q) => q.trim()).filter(Boolean);
         if (trimmedQuestions.length === 0) {
-            setResult({ kind: "error", title: "Add at least one question", body: "Use the +Add Question button to add questions before publishing." });
+            notifyError("Add at least one question", "Use +Add Question before publishing.");
             return;
         }
         const endUnix = localInputToUnix(createForm.endTimeLocal);
         if (!endUnix || Number(endUnix) <= nowTs()) {
-            setResult({ kind: "error", title: "End time must be in the future", body: "Pick a date and time later than now." });
+            notifyError("End time must be in the future", "Pick a date and time later than now.");
+            return;
+        }
+        const rewardXlmNumeric = Number(createForm.rewardXlm.trim() || "0");
+        const maxResponsesNumeric = Number(createForm.maxResponses.trim() || "0");
+        if (rewardXlmNumeric > 0 && maxResponsesNumeric <= 0) {
+            notifyError("Set Max Responses", "When the reward is greater than 0, Max Responses must be > 0 so the contract knows how much to escrow.");
             return;
         }
 
@@ -380,14 +395,7 @@ export default function App() {
             maxResponses: createForm.maxResponses.trim() || "0",
             rewardStroops: xlmToStroops(createForm.rewardXlm.trim() || "0"),
         }), {
-            onSuccess: () => {
-                setResult({
-                    kind: "success",
-                    title: `Survey "${createForm.title}" published`,
-                    body: { kind: "create", id: createForm.id, title: createForm.title, reward: createForm.rewardXlm, count: trimmedQuestions.length },
-                });
-                setCreateForm(emptyCreateForm());
-            },
+            onSuccess: () => setCreateForm(emptyCreateForm()),
             refresh: { total: true, explore: true },
         });
     };
@@ -440,20 +448,18 @@ export default function App() {
     const onExtend = () => {
         if (!requireWallet() || !manageId) return;
         const unix = localInputToUnix(manageForm.newEndTimeLocal);
-        if (!unix) { setResult({ kind: "error", title: "Pick a new end time", body: "Choose a future date and time." }); return; }
+        if (!unix) { notifyError("Pick a new end time", "Choose a future date and time."); return; }
         run("extend", `Extend ${manageId}`, () => extendSurvey({
             id: manageId,
             creator: wallet.publicKey,
             newEndTime: unix,
         }), { refresh: { explore: true } });
     };
-    const onUpdateReward = () => {
+    const onWithdrawFunds = () => {
         if (!requireWallet() || !manageId) return;
-        run("update_reward", `Update reward ${manageId}`, () => updateReward({
-            id: manageId,
-            creator: wallet.publicKey,
-            rewardStroops: xlmToStroops(manageForm.manageRewardXlm.trim() || "0"),
-        }), { refresh: { explore: true } });
+        run("withdraw", `Withdraw unused funds ${manageId}`, () =>
+            withdrawUnusedFunds({ id: manageId, creator: wallet.publicKey }),
+            { refresh: { explore: true } });
     };
     const onEnableWhitelist = () => {
         if (!requireWallet() || !manageId) return;
@@ -464,7 +470,7 @@ export default function App() {
         if (!requireWallet() || !manageId) return;
         const addresses = manageForm.whitelistAddrs.split(/[\s,]+/).map((v) => v.trim()).filter(Boolean);
         if (!addresses.length) {
-            setResult({ kind: "error", title: "Whitelist", body: "Enter at least one address." });
+            notifyError("Whitelist", "Enter at least one address.");
             return;
         }
         run("add_wl", `Whitelist +${addresses.length}`, () => addToWhitelist({
@@ -477,12 +483,6 @@ export default function App() {
     };
 
     // ---- respond ----
-    const selectForRespond = useCallback((id) => {
-        setRespondId(id);
-        const s = surveysById[id];
-        if (s) setAnswers(new Array(s.questions.length).fill(""));
-    }, [surveysById]);
-
     useEffect(() => {
         const s = surveysById[respondId];
         if (s && answers.length !== s.questions.length) {
@@ -502,11 +502,11 @@ export default function App() {
         if (!requireWallet() || !respondId) return;
         const survey = surveysById[respondId];
         if (!survey) {
-            setResult({ kind: "error", title: "Survey not found", body: respondId });
+            notifyError("Survey not found", respondId);
             return;
         }
         if (answers.some((a, i) => i < survey.questions.length && !a.trim())) {
-            setResult({ kind: "error", title: "Answer all questions", body: "Each question needs a response before submitting." });
+            notifyError("Answer all questions", "Each question needs a response before submitting.");
             return;
         }
         const payload = JSON.stringify(answers.slice(0, survey.questions.length).map((a) => a.trim()));
@@ -516,11 +516,6 @@ export default function App() {
             answers: payload,
         }), {
             onSuccess: () => {
-                setResult({
-                    kind: "success",
-                    title: "Response submitted",
-                    body: { kind: "respond", surveyId: respondId },
-                });
                 setAnswers(new Array(survey.questions.length).fill(""));
                 if (sharedSurveyId === respondId) {
                     setSharedSurveyState((prev) => ({ ...prev, submitted: true, hasResponded: true }));
@@ -558,7 +553,7 @@ export default function App() {
         if (!analyticsId) return;
         const target = (address || analyticsCheck.respondent || wallet?.publicKey || "").trim();
         if (!target) {
-            setResult({ kind: "error", title: "Address required", body: "Connect a wallet or paste an address to check." });
+            notifyError("Address required", "Connect a wallet or paste an address to check.");
             return;
         }
         run("hasResp", `Check ${truncate(target)}`, async () => {
@@ -574,26 +569,26 @@ export default function App() {
 
     // ---- explore actions ----
     const startManageFromExplore = (id) => { selectForManage(id); setActiveNav("manage"); };
-    const startRespondFromExplore = (id) => { selectForRespond(id); setActiveNav("respond"); };
+    const startRespondFromExplore = (id) => {
+        const url = `${window.location.origin}${window.location.pathname}?survey=${encodeURIComponent(id)}`;
+        window.open(url, "_blank", "noopener");
+    };
 
     const shareSurvey = async (id) => {
         const url = `${window.location.origin}${window.location.pathname}?survey=${encodeURIComponent(id)}`;
         try {
             await navigator.clipboard.writeText(url);
-            setResult({
-                kind: "info",
-                title: "Share link copied",
-                body: { kind: "share", url, surveyId: id },
-            });
+            const txId = addTx("Share link copied");
+            updateTx(txId, { status: "success" });
         } catch {
-            setResult({ kind: "info", title: "Share link", body: url });
+            notifyError("Share link", url);
         }
     };
 
     // ---- payments ----
     const openPayment = (recipient, context) => {
         if (!wallet) {
-            setResult({ kind: "error", title: "Connect wallet", body: "Connect Freighter to send a payment." });
+            notifyError("Connect wallet", "Connect Freighter to send a payment.");
             return;
         }
         setPaymentModal({ recipient, ...context, amount: "1", memo: context?.surveyId ? `Reward · ${context.surveyId}` : "Survey reward" });
@@ -601,19 +596,14 @@ export default function App() {
 
     const submitPayment = async () => {
         if (!paymentModal) return;
-        const { recipient, amount, memo, surveyId } = paymentModal;
+        const { recipient, amount, memo } = paymentModal;
         await run("payment", `Tip ${truncate(recipient)} · ${amount} XLM`, () => sendPayment({
             from: wallet.publicKey,
             to: recipient,
             amount,
             memo,
         }), {
-            onSuccess: (value) => {
-                setResult({
-                    kind: "success",
-                    title: "Payment sent",
-                    body: { kind: "payment", to: recipient, amount, surveyId, hash: value?.hash },
-                });
+            onSuccess: () => {
                 setPaymentModal(null);
             },
         });
@@ -633,14 +623,6 @@ export default function App() {
             .map((id) => surveysById[id])
             .filter((s) => s && s.creator === wallet.publicKey);
     }, [wallet, sortedSurveyIds, surveysById]);
-
-    const availableSurveys = useMemo(() => {
-        const now = nowTs();
-        return sortedSurveyIds
-            .map((id) => surveysById[id])
-            .filter((s) => s && s.status === "Active" && s.end_time > now &&
-                (s.max_responses === 0 || s.response_count < s.max_responses));
-    }, [sortedSurveyIds, surveysById]);
 
     const isBusy = busyAction != null;
 
@@ -673,7 +655,10 @@ export default function App() {
                     submitting={busyAction === "respond"}
                     disabled={isBusy}
                 />
-                <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />
+                {createPortal(
+                    <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />,
+                    document.body,
+                )}
             </>
         );
     }
@@ -750,7 +735,6 @@ export default function App() {
                             {activeNav === "explore" && "Browse surveys, share links, peek at participants"}
                             {activeNav === "create" && "Build your questions and publish on-chain"}
                             {activeNav === "manage" && "Edit your surveys and review every response"}
-                            {activeNav === "respond" && "Pick a survey and answer the questions"}
                             {activeNav === "analytics" && "Read-only contract queries"}
                         </span>
                     </div>
@@ -819,7 +803,7 @@ export default function App() {
                             onResume={onResume}
                             onClose={onClose}
                             onExtend={onExtend}
-                            onUpdateReward={onUpdateReward}
+                            onWithdrawFunds={onWithdrawFunds}
                             onEnableWhitelist={onEnableWhitelist}
                             onAddWhitelist={onAddWhitelist}
                             onShare={shareSurvey}
@@ -827,25 +811,6 @@ export default function App() {
                             onReloadResponses={() => refreshResponses(manageId)}
                             busyAction={busyAction}
                             confirmKey={confirmKey}
-                            disabled={isBusy}
-                        />
-                    )}
-
-                    {activeNav === "respond" && (
-                        <RespondPanel
-                            wallet={wallet}
-                            available={availableSurveys}
-                            allSurveys={surveysById}
-                            selectedId={respondId}
-                            survey={surveysById[respondId]}
-                            answers={answers}
-                            onSelect={selectForRespond}
-                            onSetAnswer={setAnswer}
-                            onSubmit={onSubmitResponse}
-                            onConnect={onConnect}
-                            onShare={shareSurvey}
-                            connecting={busyAction === "connect"}
-                            submitting={busyAction === "respond"}
                             disabled={isBusy}
                         />
                     )}
@@ -875,8 +840,6 @@ export default function App() {
                         />
                     )}
 
-                    <ResultPanel result={result} />
-
                     <footer className="foot">
                         <span>Built on Soroban · Stellar Testnet</span>
                         <span className="mono tiny">{CONTRACT_ID}</span>
@@ -884,7 +847,10 @@ export default function App() {
                 </main>
             </div>
 
-            <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />
+            {createPortal(
+                <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />,
+                document.body,
+            )}
 
             {paymentModal && createPortal(
                 <PaymentModal
@@ -945,6 +911,11 @@ function Stat({ label, value, small }) {
 // ---------- Create ----------
 function CreatePanel({ form, wallet, onTitleBlur, onChange, onSetQuestion, onAddQuestion, onRemoveQuestion, onSubmit, busyKey, disabled }) {
     const endUnix = localInputToUnix(form.endTimeLocal);
+    const rewardNum = Number(form.rewardXlm || "0");
+    const maxNum = Number(form.maxResponses || "0");
+    const totalEscrow = rewardNum > 0 ? rewardNum * maxNum : 0;
+    const escrowError = rewardNum > 0 && maxNum <= 0;
+
     return (
         <Section title="Create a Survey" tag="create_survey">
             <div className="grid-2">
@@ -984,9 +955,25 @@ function CreatePanel({ form, wallet, onTitleBlur, onChange, onSetQuestion, onAdd
 
             <div className="grid-2">
                 <Field label="Closes At" name="endTimeLocal" type="datetime-local" value={form.endTimeLocal} onChange={onChange} hint={endUnix ? `${formatUnix(endUnix)} · ${formatRelative(endUnix)}` : "Pick a future date and time"} />
-                <Field label="Max Responses" name="maxResponses" type="number" value={form.maxResponses} onChange={onChange} hint="0 = unlimited" />
-                <Field label="Reward per Response (XLM)" name="rewardXlm" value={form.rewardXlm} onChange={onChange} hint="Informational. Tip respondents directly from Manage." />
+                <Field label="Max Responses" name="maxResponses" type="number" value={form.maxResponses} onChange={onChange} hint={rewardNum > 0 ? "Required when reward > 0 (sets escrow size)" : "0 = unlimited"} />
+                <Field label="Reward per Response (XLM)" name="rewardXlm" value={form.rewardXlm} onChange={onChange} hint="Paid out automatically on each response from the escrow." />
                 <Field label="Creator" value={wallet ? wallet.publicKey : "Connect wallet to auto-fill"} readOnly />
+            </div>
+
+            <div className={`escrow-card ${escrowError ? "escrow-bad" : totalEscrow > 0 ? "escrow-on" : "escrow-off"}`}>
+                <div className="escrow-line">
+                    <span className="escrow-label">Total to escrow on publish</span>
+                    <span className="escrow-value">
+                        {escrowError ? "—" : `${totalEscrow.toLocaleString(undefined, { maximumFractionDigits: 7 })} XLM`}
+                    </span>
+                </div>
+                <span className="hint">
+                    {escrowError
+                        ? "Set Max Responses > 0 — the contract needs a known cap so it can hold the right amount of XLM."
+                        : totalEscrow > 0
+                            ? `${rewardNum} XLM × ${maxNum} responses. The contract holds this in escrow and pays each respondent automatically on submit.`
+                            : "No reward configured. Respondents won't receive any XLM."}
+                </span>
             </div>
 
             <div className="row">
@@ -994,9 +981,9 @@ function CreatePanel({ form, wallet, onTitleBlur, onChange, onSetQuestion, onAdd
                     type="button"
                     className={`btn btn-primary ${busyKey === "create" ? "is-loading" : ""}`}
                     onClick={onSubmit}
-                    disabled={disabled}
+                    disabled={disabled || escrowError}
                 >
-                    Publish Survey
+                    {totalEscrow > 0 ? `Publish & Escrow ${totalEscrow.toLocaleString(undefined, { maximumFractionDigits: 7 })} XLM` : "Publish Survey"}
                 </button>
             </div>
         </Section>
@@ -1019,7 +1006,7 @@ function ManageBtn({ id, label, variant = "primary", onClick, confirmKey, confir
     );
 }
 
-function ManagePanel({ wallet, mySurveys, selectedId, survey, responses, form, onSelect, onChange, onPause, onResume, onClose, onExtend, onUpdateReward, onEnableWhitelist, onAddWhitelist, onShare, onTip, onReloadResponses, busyAction, confirmKey, disabled }) {
+function ManagePanel({ wallet, mySurveys, selectedId, survey, responses, form, onSelect, onChange, onPause, onResume, onClose, onExtend, onWithdrawFunds, onEnableWhitelist, onAddWhitelist, onShare, onTip, onReloadResponses, busyAction, confirmKey, disabled }) {
     if (!wallet) {
         return (
             <Section title="Manage Surveys" tag="creator-only">
@@ -1094,7 +1081,7 @@ function ManagePanel({ wallet, mySurveys, selectedId, survey, responses, form, o
                             </div>
                         </Section>
 
-                        <Section title="Schedule & Reward" tag="lifecycle">
+                        <Section title="Schedule & Escrow" tag="lifecycle">
                             <div className="grid-2">
                                 <Field
                                     label="New End Time"
@@ -1105,15 +1092,15 @@ function ManagePanel({ wallet, mySurveys, selectedId, survey, responses, form, o
                                     hint={form.newEndTimeLocal ? `${formatUnix(localInputToUnix(form.newEndTimeLocal))} · ${formatRelative(localInputToUnix(form.newEndTimeLocal))}` : "Must be later than current end"}
                                 />
                                 <Field
-                                    label="Reward per Response (XLM)"
-                                    value={form.manageRewardXlm}
-                                    onChange={(e) => onChange({ manageRewardXlm: e.target.value })}
-                                    hint="0 to clear"
+                                    label="Funds remaining in escrow"
+                                    value={`${stroopsToXlm(survey.funded_remaining || 0n)} XLM`}
+                                    readOnly
+                                    hint="Auto-paid to respondents on each submission. Withdraw remainder once the survey is closed or expired."
                                 />
                             </div>
                             <div className="row wrap">
                                 <ManageBtn id="extend" label="Save End Time" variant="outline" onClick={onExtend} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
-                                <ManageBtn id="update_reward" label="Save Reward" variant="outline" onClick={onUpdateReward} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
+                                <ManageBtn id="withdraw" label="Withdraw Unused Funds" variant="ghost" onClick={onWithdrawFunds} busyAction={busyAction} confirmKey={confirmKey} disabled={disabled} />
                             </div>
                         </Section>
 
@@ -1208,111 +1195,6 @@ function ResponsesSection({ survey, responses, onReload, onTip, wallet }) {
     );
 }
 
-// ---------- Respond ----------
-function RespondPanel({ wallet, available, allSurveys, selectedId, survey, answers, onSelect, onSetAnswer, onSubmit, onConnect, onShare, connecting, submitting, disabled }) {
-    const surveyForView = survey || (selectedId ? allSurveys[selectedId] : null);
-    return (
-        <div className="respond-grid">
-            <aside className="respond-list card">
-                <div className="panel-head">
-                    <h2>Available</h2>
-                    <span className="panel-tag">{available.length}</span>
-                </div>
-                {available.length === 0 ? (
-                    <p className="hint">No active surveys at the moment.</p>
-                ) : (
-                    <ul className="manage-list-ul">
-                        {available.map((s) => (
-                            <li key={s.id}>
-                                <button
-                                    type="button"
-                                    className={`manage-list-item ${selectedId === s.id ? "is-active" : ""}`}
-                                    onClick={() => onSelect(s.id)}
-                                >
-                                    <div className="manage-list-top">
-                                        <span className="survey-id-tag">{s.id}</span>
-                                        <StatusPill status={s.status} />
-                                    </div>
-                                    <span className="manage-list-title">{s.title}</span>
-                                    <span className="manage-list-meta">
-                                        {s.question_count} question{s.question_count === 1 ? "" : "s"} · ends {formatRelative(s.end_time)}
-                                    </span>
-                                </button>
-                            </li>
-                        ))}
-                    </ul>
-                )}
-            </aside>
-
-            <div className="respond-detail">
-                {!surveyForView ? (
-                    <div className="empty-state inset">
-                        <span className="empty-icon">←</span>
-                        <h3>Pick a survey</h3>
-                        <p>Choose one from the list to start answering.</p>
-                    </div>
-                ) : (
-                    <>
-                        <Section title={surveyForView.title} tag={surveyForView.id}>
-                            <div className="manage-summary">
-                                <StatusPill status={surveyForView.status} />
-                                <Stat label="Reward" value={`${stroopsToXlm(surveyForView.reward_per_response)} XLM`} />
-                                <Stat label="Closes" value={formatUnix(surveyForView.end_time)} small />
-                                <Stat label="Responses" value={`${surveyForView.response_count}${surveyForView.max_responses ? ` / ${surveyForView.max_responses}` : ""}`} />
-                            </div>
-                            <p className="manage-desc">{surveyForView.description || <em>No description provided.</em>}</p>
-                            <div className="row wrap">
-                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => onShare(surveyForView.id)}>↗ Copy Share Link</button>
-                            </div>
-                        </Section>
-
-                        {!wallet ? (
-                            <Section title="Connect to Respond" tag="wallet required">
-                                <div className="connect-cta">
-                                    <p>You're viewing <strong>{surveyForView.title}</strong>. Connect Freighter to submit your answers — your wallet address acts as your signature.</p>
-                                    <button
-                                        type="button"
-                                        className={`btn btn-primary btn-lg ${connecting ? "is-loading" : ""}`}
-                                        onClick={onConnect}
-                                        disabled={disabled}
-                                    >
-                                        Connect Freighter
-                                    </button>
-                                </div>
-                            </Section>
-                        ) : (
-                            <Section title="Your Response" tag="submit_response">
-                                <div className="answers-stack">
-                                    {surveyForView.questions.map((q, i) => (
-                                        <div className="answer-row" key={i}>
-                                            <label><span className="q-num">Q{i + 1}</span> {q}</label>
-                                            <textarea
-                                                rows={2}
-                                                value={answers[i] || ""}
-                                                onChange={(e) => onSetAnswer(i, e.target.value)}
-                                                placeholder="Your answer…"
-                                            />
-                                        </div>
-                                    ))}
-                                </div>
-                                <div className="row">
-                                    <button
-                                        type="button"
-                                        className={`btn btn-primary ${submitting ? "is-loading" : ""}`}
-                                        onClick={onSubmit}
-                                        disabled={disabled}
-                                    >
-                                        Submit Response
-                                    </button>
-                                </div>
-                            </Section>
-                        )}
-                    </>
-                )}
-            </div>
-        </div>
-    );
-}
 
 // ---------- Explore ----------
 function ExplorePanel({ ids, surveys, responses, loading, onRefresh, onExpand, onCollapse, onRespond, onManage, onShare, onTip, onLoadResponses, wallet, expanded }) {
@@ -1440,108 +1322,6 @@ function ExplorePanel({ ids, surveys, responses, loading, onRefresh, onExpand, o
     );
 }
 
-// ---------- Result ----------
-function ResultPanel({ result }) {
-    if (result.kind === "idle") return null;
-    return (
-        <section className={`card result result-${result.kind}`}>
-            <div className="panel-head">
-                <h2>{result.title || "Result"}</h2>
-                <span className={`panel-tag tag-${result.kind}`}>{result.kind}</span>
-            </div>
-            <ResultBody body={result.body} />
-        </section>
-    );
-}
-
-function ResultBody({ body }) {
-    if (body == null) return <p className="result-empty">No data.</p>;
-    if (typeof body === "string") return <p className="result-text">{body}</p>;
-    if (typeof body !== "object" || !body.kind) return <pre className="result-pre">{JSON.stringify(body, null, 2)}</pre>;
-
-    if (body.kind === "stat") {
-        return (
-            <div className="big-stat">
-                <span className="big-stat-label">{body.stat}</span>
-                <span className="big-stat-value">{body.value}</span>
-            </div>
-        );
-    }
-    if (body.kind === "boolean") {
-        return (
-            <div className={`bool-stat ${body.value ? "bool-yes" : "bool-no"}`}>
-                <span className="bool-icon">{body.value ? "✓" : "✗"}</span>
-                <span className="bool-label">{body.label}</span>
-                <span className="bool-value">{body.value ? "Yes" : "No"}</span>
-            </div>
-        );
-    }
-    if (body.kind === "ids") {
-        return (
-            <ul className="id-list">
-                {(body.ids || []).map((id) => <li key={id} className="mono">{id}</li>)}
-                {(!body.ids || body.ids.length === 0) && <li>No surveys yet.</li>}
-            </ul>
-        );
-    }
-    if (body.kind === "survey") {
-        const s = body.survey;
-        return (
-            <div className="survey-detail">
-                <h3>{s.title}</h3>
-                <p>{s.description}</p>
-                <div className="survey-meta">
-                    <Stat label="Status" value={s.status} />
-                    <Stat label="Responses" value={`${s.response_count}${s.max_responses ? ` / ${s.max_responses}` : ""}`} />
-                    <Stat label="Questions" value={s.question_count} />
-                    <Stat label="Reward" value={`${stroopsToXlm(s.reward_per_response)} XLM`} />
-                    <Stat label="Created" value={formatUnix(s.created_at)} small />
-                    <Stat label="Closes" value={formatUnix(s.end_time)} small />
-                </div>
-                <div className="creator-row">
-                    <span className="meta-label">Creator</span>
-                    <span className="mono small">{s.creator}</span>
-                </div>
-            </div>
-        );
-    }
-    if (body.kind === "share") {
-        return (
-            <div className="share-result">
-                <p>Share this link to invite someone to respond:</p>
-                <code className="share-link mono small">{body.url}</code>
-            </div>
-        );
-    }
-    if (body.kind === "payment") {
-        return (
-            <div className="payment-result">
-                <p><strong>{body.amount} XLM</strong> sent to <span className="mono small">{truncate(body.to, 8, 8)}</span></p>
-                {body.hash && (
-                    <a href={`https://stellar.expert/explorer/testnet/tx/${body.hash}`} target="_blank" rel="noreferrer" className="link-btn">
-                        View transaction ↗
-                    </a>
-                )}
-            </div>
-        );
-    }
-    if (body.kind === "create") {
-        return (
-            <div className="result-flat">
-                <p><strong>{body.title}</strong> published as <span className="mono">{body.id}</span> with {body.count} question{body.count === 1 ? "" : "s"}.</p>
-                {body.reward && Number(body.reward) > 0 && <p>Reward: {body.reward} XLM per response (informational).</p>}
-            </div>
-        );
-    }
-    if (body.kind === "respond") {
-        return (
-            <div className="result-flat">
-                <p>Response submitted to <strong className="mono">{body.surveyId}</strong>. Thanks!</p>
-            </div>
-        );
-    }
-    return <pre className="result-pre">{JSON.stringify(body, null, 2)}</pre>;
-}
 
 // ---------- Analytics ----------
 function AnalyticsPanel({ wallet, scope, onSetScope, mySurveys, allIds, surveys, responses, selectedId, onSelect, check, onSetCheck, loading, onCheckHasResponded, onShare, onTip, onReloadResponses, onRefresh, totalCount, busyAction, disabled }) {
@@ -1891,7 +1671,7 @@ function SharedRespondPage({ state, surveyId, wallet, answers, onSetAnswer, onCo
                             <div className="shared-success">
                                 <span className="shared-success-icon">✓</span>
                                 <h2>Thanks for your response!</h2>
-                                <p>Your answers were recorded on-chain. The creator can now view your submission and may send a reward.</p>
+                                <p>Your answers were recorded on-chain.</p>
                                 <button type="button" className="btn btn-outline" onClick={onExit}>Browse other surveys</button>
                             </div>
                         )}

@@ -1601,6 +1601,45 @@ input[type="datetime-local"] {
     transition: width 0.4s ease;
 }
 
+/* ---------- Escrow card (Create page) ---------- */
+.escrow-card {
+    border: var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
+    box-shadow: 4px 4px 0 0 var(--ink);
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.escrow-on { background: var(--accent-3); color: #fff; }
+.escrow-off { background: var(--paper-2); color: var(--ink); }
+.escrow-bad { background: #fff0f3; color: var(--danger); border-color: var(--danger); box-shadow: 4px 4px 0 0 var(--danger); }
+
+.escrow-line {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.85rem;
+    flex-wrap: wrap;
+}
+
+.escrow-label {
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.escrow-value {
+    font-size: clamp(1.25rem, 3vw, 1.6rem);
+    font-weight: 900;
+    letter-spacing: -0.02em;
+}
+
+.escrow-card .hint { color: inherit; opacity: 0.92; font-family: inherit; }
+
 /* ---------- Shared Respond Page (public link landing) ---------- */
 .shared-page {
     min-height: 100vh;
