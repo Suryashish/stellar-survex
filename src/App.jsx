@@ -592,9 +592,9 @@ export default function App() {
             <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
                 <div className="sidebar-bar">
                     <div className="brand">
-                        <div className="brand-mark">SB</div>
+                        <div className="brand-mark">SX</div>
                         <div className="brand-text">
-                            <strong>Survey Builder</strong>
+                            <strong>Survex</strong>
                             <span>Soroban · Testnet</span>
                         </div>
                     </div>

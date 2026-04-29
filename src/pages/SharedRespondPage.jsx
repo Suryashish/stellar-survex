@@ -20,10 +20,10 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
             <div className="grain" aria-hidden="true" />
 
             <header className="shared-header">
-                <button type="button" className="shared-brand" onClick={onExit} title="Open Survey Builder">
-                    <span className="brand-mark">SB</span>
+                <button type="button" className="shared-brand" onClick={onExit} title="Open Survex">
+                    <span className="brand-mark">SX</span>
                     <span className="brand-text">
-                        <strong>Survey Builder</strong>
+                        <strong>Survex</strong>
                         <span>Soroban · Testnet</span>
                     </span>
                 </button>
@@ -174,7 +174,7 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
                 )}
 
                 <div className="shared-foot">
-                    <button type="button" className="link-btn" onClick={onExit}>← Open the full Survey Builder app</button>
+                    <button type="button" className="link-btn" onClick={onExit}>← Open the full Survex app</button>
                 </div>
             </main>
         </div>
