@@ -46,6 +46,7 @@ export default function App() {
     const [wallet, setWallet] = useState(null);
     const [network, setNetwork] = useState("");
     const [activeNav, setActiveNav] = useState("explore");
+    const [mobileNavOpen, setMobileNavOpen] = useState(false);
     const [busyAction, setBusyAction] = useState(null);
     const [transactions, setTransactions] = useState([]);
     const [totalCount, setTotalCount] = useState(null);
@@ -588,13 +589,26 @@ export default function App() {
             <div className="grain" aria-hidden="true" />
 
             {/* ===== Sidebar ===== */}
-            <aside className="sidebar">
-                <div className="brand">
-                    <div className="brand-mark">SB</div>
-                    <div className="brand-text">
-                        <strong>Survey Builder</strong>
-                        <span>Soroban · Testnet</span>
+            <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
+                <div className="sidebar-bar">
+                    <div className="brand">
+                        <div className="brand-mark">SB</div>
+                        <div className="brand-text">
+                            <strong>Survey Builder</strong>
+                            <span>Soroban · Testnet</span>
+                        </div>
                     </div>
+                    <button
+                        type="button"
+                        className="nav-toggle"
+                        aria-label={mobileNavOpen ? "Close menu" : "Open menu"}
+                        aria-expanded={mobileNavOpen}
+                        onClick={() => setMobileNavOpen((v) => !v)}
+                    >
+                        <span className="nav-toggle-icon" aria-hidden="true">
+                            {mobileNavOpen ? "✕" : "☰"}
+                        </span>
+                    </button>
                 </div>
 
                 <nav className="nav">
@@ -603,7 +617,7 @@ export default function App() {
                             key={item.key}
                             type="button"
                             className={`nav-item ${activeNav === item.key ? "nav-active" : ""}`}
-                            onClick={() => setActiveNav(item.key)}
+                            onClick={() => { setActiveNav(item.key); setMobileNavOpen(false); }}
                         >
                             <span className="nav-num">{item.num}</span>
                             <span className="nav-label">{item.label}</span>
