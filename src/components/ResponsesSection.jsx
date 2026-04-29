@@ -1,11 +1,22 @@
 import { formatUnix } from "../../lib/stellar.js";
+import { downloadResponsesCsv } from "../utils/exportResponses.js";
 import Section from "./Section.jsx";
 
 export default function ResponsesSection({ survey, responses, onReload, onTip, wallet }) {
+    const hasResponses = Array.isArray(responses) && responses.length > 0;
     return (
         <Section title="Responses" tag={`${responses ? responses.length : "—"} total`}>
             <div className="row" style={{ marginBottom: "0.75rem" }}>
                 <button type="button" className="btn btn-outline btn-sm" onClick={onReload}>Reload</button>
+                <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    onClick={() => downloadResponsesCsv(survey, responses)}
+                    disabled={!hasResponses}
+                    title={hasResponses ? "Download all responses as CSV" : "No responses to export"}
+                >
+                    ⬇ Export CSV
+                </button>
             </div>
 
             {!responses && <p className="hint">Loading responses…</p>}

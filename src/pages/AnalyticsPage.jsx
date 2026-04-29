@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { stroopsToXlm, formatUnix, formatRelative } from "../../lib/stellar.js";
 import { truncate } from "../utils/constants.js";
+import { downloadResponsesCsv } from "../utils/exportResponses.js";
 import Section from "../components/Section.jsx";
 import Field from "../components/Field.jsx";
 import StatusPill from "../components/StatusPill.jsx";
@@ -178,6 +179,17 @@ export default function AnalyticsPage({ wallet, scope, onSetScope, mySurveys, al
                         </Section>
 
                         <Section title="All Responses" tag={`${responseList ? responseList.length : "—"} entries`}>
+                            <div className="row wrap" style={{ marginBottom: "0.75rem" }}>
+                                <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm"
+                                    onClick={() => downloadResponsesCsv(selected, responseList)}
+                                    disabled={!responseList || responseList.length === 0}
+                                    title={responseList && responseList.length > 0 ? "Download all responses as CSV" : "No responses to export"}
+                                >
+                                    ⬇ Export CSV
+                                </button>
+                            </div>
                             {loading && <p className="hint">Loading…</p>}
                             {!loading && (!responseList || responseList.length === 0) && (
                                 <p className="hint">No responses yet. Share the link to invite people.</p>
