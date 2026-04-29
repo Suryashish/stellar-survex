@@ -3,11 +3,8 @@ import { stroopsToXlm, formatUnix } from "../../lib/stellar.js";
 import { nowTs } from "../utils/constants.js";
 import Stat from "../components/Stat.jsx";
 
-export default function SharedRespondPage({ state, surveyId, wallet, answers, onSetAnswer, onConnect, onDisconnect, onSubmit, onExit, connecting, submitting, disabled, pointsConfig, pointsMeta }) {
+export default function SharedRespondPage({ state, surveyId, wallet, answers, onSetAnswer, onConnect, onDisconnect, onSubmit, onExit, connecting, submitting, disabled }) {
     const { loading, survey, hasResponded: alreadyResponded, submitted, isPrivate, canView } = state;
-    const respondentPts = pointsConfig?.respondent ? BigInt(pointsConfig.respondent) : 0n;
-    const pointsActive = !!(pointsConfig?.token && respondentPts > 0n);
-    const pointsSymbol = pointsMeta?.symbol || "PTS";
     const flags = useMemo(() => {
         if (!survey) return { expired: false, closed: false, full: false, blocking: false };
         const expired = survey.end_time < nowTs();
@@ -90,9 +87,6 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
                             <Stat label="Questions" value={survey.question_count} />
                             <Stat label="Responses" value={`${survey.response_count}${survey.max_responses ? ` / ${survey.max_responses}` : ""}`} />
                             <Stat label="Reward" value={`${stroopsToXlm(survey.reward_per_response)} XLM`} />
-                            {pointsActive && (
-                                <Stat label="Bonus" value={`+${String(respondentPts)} ${pointsSymbol}`} />
-                            )}
                             <Stat label="Closes" value={`${formatUnix(survey.end_time)}`} small />
                         </div>
 
@@ -197,7 +191,7 @@ export default function SharedRespondPage({ state, surveyId, wallet, answers, on
                                         onClick={onSubmit}
                                         disabled={disabled}
                                     >
-                                        Submit Response{pointsActive ? ` · +${String(respondentPts)} ${pointsSymbol}` : ""}
+                                        Submit Response
                                     </button>
                                     <span className="hint">
                                         Submitting signs a Soroban transaction with your wallet. Network fees are paid in XLM.

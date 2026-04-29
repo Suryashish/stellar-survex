@@ -856,8 +856,6 @@ export default function App() {
                     connecting={busyAction === "connect"}
                     submitting={busyAction === "respond"}
                     disabled={isBusy}
-                    pointsConfig={pointsConfig}
-                    pointsMeta={pointsMeta}
                 />
                 {createPortal(
                     <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />,

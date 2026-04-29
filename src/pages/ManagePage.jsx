@@ -185,7 +185,14 @@ export default function ManagePage({
         );
     }
 
-    const setupPanel = (
+    // Setup is "fully initialized" when an admin has been claimed, the token
+    // contract is initialized (metadata visible), and a points config has been
+    // saved on the survey contract. After that point we hide the panel from
+    // everyone except the contract admin themselves.
+    const fullyInitialized = !!(contractAdmin && pointsMeta?.symbol && pointsConfig?.token);
+    const isContractAdmin = !!(wallet && contractAdmin && wallet.publicKey === contractAdmin);
+    const showSetupPanel = !fullyInitialized || isContractAdmin;
+    const setupPanel = showSetupPanel ? (
         <PointsAdminPanel
             wallet={wallet}
             contractAdmin={contractAdmin}
@@ -200,7 +207,7 @@ export default function ManagePage({
             busyAction={busyAction}
             disabled={disabled}
         />
-    );
+    ) : null;
 
     if (mySurveys.length === 0) {
         return (
