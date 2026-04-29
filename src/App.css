@@ -2218,3 +2218,72 @@ input[type="datetime-local"] {
     .visibility-toggle { grid-template-columns: 1fr; }
 }
 
+/* ---------- Points / Reward setup ---------- */
+.points-card {
+    border: var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.75rem 0.95rem;
+    margin-bottom: 1rem;
+    box-shadow: 4px 4px 0 0 var(--ink);
+    background: var(--accent-4);
+    color: var(--ink);
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+.points-line {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.85rem;
+}
+.points-label {
+    font-size: 0.75rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.points-value {
+    font-size: 1.1rem;
+    font-weight: 900;
+}
+
+.setup-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem;
+}
+.setup-step {
+    border: var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.75rem 0.85rem;
+    background: var(--paper);
+    box-shadow: 3px 3px 0 0 var(--ink);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.setup-step-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+}
+.setup-step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 0.4rem;
+    border: var(--border);
+    border-radius: 999px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 0.75rem;
+    font-weight: 900;
+}
+@media (max-width: 720px) {
+    .setup-grid { grid-template-columns: 1fr; }
+}
+
+

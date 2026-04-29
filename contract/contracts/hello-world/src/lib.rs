@@ -1,9 +1,17 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
     token, Address, Env, String, Symbol, Vec,
 };
+
+// Typed client for the companion `points-token` contract. Lets the survey
+// contract call mint() on the token without depending on its source crate.
+#[contractclient(name = "PointsTokenClient")]
+pub trait PointsTokenInterface {
+    fn mint(env: Env, caller: Address, to: Address, amount: i128);
+    fn balance(env: Env, addr: Address) -> i128;
+}
 
 // --- Data Structures ---
 
@@ -60,6 +68,11 @@ pub enum DataKey {
     Private(Symbol),
     // New: addresses allowed to see/respond to a private survey.
     AllowedViewers(Symbol),
+    // Contract-wide configuration set by the contract admin.
+    ContractAdmin,
+    PointsToken,
+    CreatorPoints,
+    RespondentPoints,
 }
 
 // --- Errors ---
@@ -82,6 +95,8 @@ pub enum ContractError {
     InvalidQuestions  = 12,
     CannotWithdraw    = 13,
     NotAllowedViewer  = 14,
+    NotContractAdmin  = 15,
+    AlreadyInitialized = 16,
 }
 
 // --- Contract ---
@@ -169,6 +184,26 @@ impl SurveyBuilderContract {
             return;
         }
         panic_with_error!(env, ContractError::NotAuthorized);
+    }
+
+    /// Mint reward points to `recipient` if the contract admin has wired up
+    /// a points-token and configured a non-zero reward amount.
+    /// Mint failures (token contract not authorising us, etc.) are intentionally
+    /// allowed to bubble up so the calling action also reverts — keeps the
+    /// reward in lock-step with the on-chain action.
+    fn mint_points(env: &Env, recipient: &Address, amount_key: &DataKey) {
+        let token_addr: Option<Address> = env.storage().instance().get(&DataKey::PointsToken);
+        let amount: i128 = env.storage().instance().get(amount_key).unwrap_or(0);
+        let token_addr = match token_addr {
+            Some(addr) => addr,
+            None => return,
+        };
+        if amount <= 0 {
+            return;
+        }
+        let client = PointsTokenClient::new(env, &token_addr);
+        let caller = env.current_contract_address();
+        client.mint(&caller, recipient, &amount);
     }
 
     fn can_view_internal(env: &Env, id: &Symbol, addr: &Address) -> bool {
@@ -272,6 +307,9 @@ impl SurveyBuilderContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalCount, &(count + 1));
+
+        // Reward the creator with points-token (no-op if unconfigured).
+        Self::mint_points(&env, &survey.creator, &DataKey::CreatorPoints);
     }
 
     pub fn pause_survey(env: Env, id: Symbol, caller: Address) {
@@ -546,6 +584,9 @@ impl SurveyBuilderContract {
         }
 
         Self::save_survey(&env, &survey);
+
+        // Reward the respondent with points-token (no-op if unconfigured).
+        Self::mint_points(&env, &respondent, &DataKey::RespondentPoints);
     }
 
     // -- Read-only queries --
@@ -626,5 +667,69 @@ impl SurveyBuilderContract {
 
     pub fn can_view(env: Env, id: Symbol, addr: Address) -> bool {
         Self::can_view_internal(&env, &id, &addr)
+    }
+
+    // -- Contract admin & points-token configuration --
+
+    /// One-time bootstrap: assigns the contract-wide admin who can later wire
+    /// the points-token integration. Anyone can call this once after deploy.
+    pub fn init_admin(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::ContractAdmin) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::ContractAdmin, &admin);
+    }
+
+    /// Configure (or rotate) the reward points integration. Only the contract
+    /// admin can call this. Pass amounts in the token's base units.
+    pub fn set_points_config(
+        env: Env,
+        admin: Address,
+        token: Address,
+        creator_points: i128,
+        respondent_points: i128,
+    ) {
+        admin.require_auth();
+        Self::assert_contract_admin(&env, &admin);
+        if creator_points < 0 || respondent_points < 0 {
+            panic_with_error!(&env, ContractError::InvalidReward);
+        }
+        env.storage().instance().set(&DataKey::PointsToken, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::CreatorPoints, &creator_points);
+        env.storage()
+            .instance()
+            .set(&DataKey::RespondentPoints, &respondent_points);
+    }
+
+    /// Convenience read: (token_address, creator_points, respondent_points).
+    /// Returns zero amounts and `None` token when not configured.
+    pub fn get_points_config(env: Env) -> (Option<Address>, i128, i128) {
+        let token: Option<Address> = env.storage().instance().get(&DataKey::PointsToken);
+        let creator: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CreatorPoints)
+            .unwrap_or(0);
+        let respondent: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RespondentPoints)
+            .unwrap_or(0);
+        (token, creator, respondent)
+    }
+
+    pub fn get_contract_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ContractAdmin)
+    }
+
+    fn assert_contract_admin(env: &Env, caller: &Address) {
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::ContractAdmin);
+        match admin {
+            Some(a) if &a == caller => {}
+            _ => panic_with_error!(env, ContractError::NotContractAdmin),
+        }
     }
 }

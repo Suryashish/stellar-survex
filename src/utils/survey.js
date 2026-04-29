@@ -69,6 +69,9 @@ export const emptyCreateForm = () => ({
 export const isValidStellarAddress = (addr) =>
     typeof addr === "string" && /^G[A-Z2-7]{55}$/.test(addr.trim());
 
+export const isValidContractId = (addr) =>
+    typeof addr === "string" && /^C[A-Z2-7]{55}$/.test(addr.trim());
+
 export const parseAddressList = (raw) =>
     String(raw || "")
         .split(/[\s,]+/)

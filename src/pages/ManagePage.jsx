@@ -1,4 +1,5 @@
-import { stroopsToXlm, formatUnix, formatRelative, localInputToUnix } from "../../lib/stellar.js";
+import { useState } from "react";
+import { stroopsToXlm, formatUnix, formatRelative, localInputToUnix, CONTRACT_ID } from "../../lib/stellar.js";
 import { truncate } from "../utils/constants.js";
 import Section from "../components/Section.jsx";
 import Field from "../components/Field.jsx";
@@ -6,6 +7,131 @@ import StatusPill from "../components/StatusPill.jsx";
 import Stat from "../components/Stat.jsx";
 import ManageBtn from "../components/ManageBtn.jsx";
 import ResponsesSection from "../components/ResponsesSection.jsx";
+
+function PointsAdminPanel({
+    wallet,
+    contractAdmin,
+    pointsConfig,
+    pointsMeta,
+    pointsBalance,
+    pointsTokenId,
+    onClaimSurveyAdmin,
+    onInitToken,
+    onSetTokenMinter,
+    onSavePointsConfig,
+    busyAction,
+    disabled,
+}) {
+    const [tokenForm, setTokenForm] = useState({ name: "Survex Points", symbol: "SXP", decimals: "0" });
+    const [cfgForm, setCfgForm] = useState({
+        token: pointsTokenId || "",
+        creatorPoints: "10",
+        respondentPoints: "1",
+    });
+    const isAdmin = !!(wallet && contractAdmin && wallet.publicKey === contractAdmin);
+    const adminUnclaimed = !contractAdmin;
+    const tokenInitialized = !!pointsMeta?.symbol;
+
+    return (
+        <Section title="Reward Points Setup" tag="admin">
+            <div className="setup-grid">
+                <div className="setup-step">
+                    <div className="setup-step-head">
+                        <span className="setup-step-num">1</span>
+                        <strong>Survey contract admin</strong>
+                    </div>
+                    {contractAdmin ? (
+                        <p className="hint">
+                            Current admin: <span className="mono small">{truncate(contractAdmin, 8, 8)}</span>
+                            {isAdmin && " (you)"}
+                        </p>
+                    ) : (
+                        <p className="hint warn">No admin set. Claim it with your wallet to configure points.</p>
+                    )}
+                    {adminUnclaimed && wallet && (
+                        <ManageBtn id="init_admin" label="Claim admin role" onClick={onClaimSurveyAdmin} busyAction={busyAction} disabled={disabled} />
+                    )}
+                </div>
+
+                <div className="setup-step">
+                    <div className="setup-step-head">
+                        <span className="setup-step-num">2</span>
+                        <strong>Initialize points token</strong>
+                    </div>
+                    {!pointsTokenId && (
+                        <p className="hint warn">
+                            POINTS_TOKEN_ID isn't set in lib/stellar.js. Deploy the points-token contract first, then paste its address there.
+                        </p>
+                    )}
+                    {pointsTokenId && tokenInitialized && (
+                        <p className="hint">
+                            Initialized: <strong>{pointsMeta.name}</strong> ({pointsMeta.symbol}) · supply {String(pointsMeta.totalSupply || 0n)}
+                        </p>
+                    )}
+                    {pointsTokenId && !tokenInitialized && isAdmin && (
+                        <>
+                            <div className="grid-2">
+                                <Field label="Name" name="name" value={tokenForm.name} onChange={(e) => setTokenForm({ ...tokenForm, name: e.target.value })} />
+                                <Field label="Symbol" name="symbol" value={tokenForm.symbol} onChange={(e) => setTokenForm({ ...tokenForm, symbol: e.target.value })} />
+                                <Field label="Decimals" name="decimals" type="number" value={tokenForm.decimals} onChange={(e) => setTokenForm({ ...tokenForm, decimals: e.target.value })} />
+                            </div>
+                            <ManageBtn id="init_token" label="Initialize token" onClick={() => onInitToken(tokenForm)} busyAction={busyAction} disabled={disabled} />
+                        </>
+                    )}
+                </div>
+
+                <div className="setup-step">
+                    <div className="setup-step-head">
+                        <span className="setup-step-num">3</span>
+                        <strong>Authorize survey contract as minter</strong>
+                    </div>
+                    <p className="hint">
+                        Give this survey contract permission to mint points. Survey contract id: <span className="mono small">{truncate(CONTRACT_ID, 8, 8)}</span>
+                    </p>
+                    {pointsTokenId && tokenInitialized && isAdmin && (
+                        <ManageBtn id="set_minter" label="Set survey contract as minter" onClick={() => onSetTokenMinter(CONTRACT_ID)} busyAction={busyAction} disabled={disabled} />
+                    )}
+                </div>
+
+                <div className="setup-step">
+                    <div className="setup-step-head">
+                        <span className="setup-step-num">4</span>
+                        <strong>Set point amounts</strong>
+                    </div>
+                    {pointsConfig?.token ? (
+                        <p className="hint">
+                            Currently: creator earns <strong>{String(pointsConfig.creator)}</strong>, respondent earns <strong>{String(pointsConfig.respondent)}</strong> per action.
+                            <br />
+                            Token: <span className="mono small">{truncate(pointsConfig.token, 8, 8)}</span>
+                        </p>
+                    ) : (
+                        <p className="hint">No points config yet. Set the token address and amounts below.</p>
+                    )}
+                    {isAdmin && (
+                        <>
+                            <div className="grid-2">
+                                <Field label="Token contract id" name="token" value={cfgForm.token} onChange={(e) => setCfgForm({ ...cfgForm, token: e.target.value })} placeholder="C…" />
+                                <Field label="Per-creator points" name="creatorPoints" type="number" value={cfgForm.creatorPoints} onChange={(e) => setCfgForm({ ...cfgForm, creatorPoints: e.target.value })} />
+                                <Field label="Per-respondent points" name="respondentPoints" type="number" value={cfgForm.respondentPoints} onChange={(e) => setCfgForm({ ...cfgForm, respondentPoints: e.target.value })} />
+                            </div>
+                            <ManageBtn id="set_points_cfg" label="Save points configuration" onClick={() => onSavePointsConfig(cfgForm)} busyAction={busyAction} disabled={disabled} />
+                        </>
+                    )}
+                </div>
+
+                {wallet && pointsTokenId && tokenInitialized && (
+                    <div className="setup-step">
+                        <div className="setup-step-head">
+                            <span className="setup-step-num">★</span>
+                            <strong>Your balance</strong>
+                        </div>
+                        <p className="hint">{String(pointsBalance || 0n)} {pointsMeta.symbol}</p>
+                    </div>
+                )}
+            </div>
+        </Section>
+    );
+}
 
 export default function ManagePage({
     wallet,
@@ -34,6 +160,15 @@ export default function ManagePage({
     onSetVisibility,
     onAddViewers,
     onRemoveViewer,
+    pointsConfig,
+    pointsMeta,
+    pointsBalance,
+    contractAdmin,
+    pointsTokenId,
+    onClaimSurveyAdmin,
+    onInitToken,
+    onSetTokenMinter,
+    onSavePointsConfig,
     busyAction,
     confirmKey,
     disabled,
@@ -49,15 +184,36 @@ export default function ManagePage({
             </Section>
         );
     }
+
+    const setupPanel = (
+        <PointsAdminPanel
+            wallet={wallet}
+            contractAdmin={contractAdmin}
+            pointsConfig={pointsConfig}
+            pointsMeta={pointsMeta}
+            pointsBalance={pointsBalance}
+            pointsTokenId={pointsTokenId}
+            onClaimSurveyAdmin={onClaimSurveyAdmin}
+            onInitToken={onInitToken}
+            onSetTokenMinter={onSetTokenMinter}
+            onSavePointsConfig={onSavePointsConfig}
+            busyAction={busyAction}
+            disabled={disabled}
+        />
+    );
+
     if (mySurveys.length === 0) {
         return (
-            <Section title="Manage Surveys" tag="creator-only">
-                <div className="empty-state inset">
-                    <span className="empty-icon">∅</span>
-                    <h3>No surveys to manage yet</h3>
-                    <p>Head to <strong>01 / Create</strong> to publish a survey, or ask a creator to add you as a co-admin.</p>
-                </div>
-            </Section>
+            <>
+                {setupPanel}
+                <Section title="Manage Surveys" tag="creator-only">
+                    <div className="empty-state inset">
+                        <span className="empty-icon">∅</span>
+                        <h3>No surveys to manage yet</h3>
+                        <p>Head to <strong>01 / Create</strong> to publish a survey, or ask a creator to add you as a co-admin.</p>
+                    </div>
+                </Section>
+            </>
         );
     }
 
@@ -68,6 +224,8 @@ export default function ManagePage({
     const viewerList = viewers || [];
 
     return (
+        <>
+        {setupPanel}
         <div className="manage-grid">
             <aside className="manage-list card">
                 <div className="panel-head">
@@ -303,5 +461,6 @@ export default function ManagePage({
                 )}
             </div>
         </div>
+        </>
     );
 }

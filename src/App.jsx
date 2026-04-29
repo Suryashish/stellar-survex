@@ -30,6 +30,15 @@ import {
     getAllowedViewers,
     isPrivateSurvey,
     canView,
+    initSurveyAdmin,
+    setSurveyPointsConfig,
+    getSurveyPointsConfig,
+    getSurveyContractAdmin,
+    initPointsToken,
+    setPointsTokenMinter,
+    getPointsBalance,
+    getPointsMetadata,
+    POINTS_TOKEN_ID,
     sendPayment,
     xlmToStroops,
     stroopsToXlm,
@@ -40,7 +49,7 @@ import {
 } from "../lib/stellar.js";
 
 import { NAV, nowTs, truncate, newTxId } from "./utils/constants.js";
-import { normalizeSurvey, decodeAnswers, slugifyId, emptyCreateForm, isValidStellarAddress, parseAddressList } from "./utils/survey.js";
+import { normalizeSurvey, decodeAnswers, slugifyId, emptyCreateForm, isValidStellarAddress, isValidContractId, parseAddressList } from "./utils/survey.js";
 
 import TxDrawer from "./components/TxDrawer.jsx";
 import PaymentModal from "./components/PaymentModal.jsx";
@@ -95,6 +104,12 @@ export default function App() {
     const [analyticsCheck, setAnalyticsCheck] = useState({ accepting: null, hasResponded: null, respondent: "" });
     const [analyticsLoading, setAnalyticsLoading] = useState(false);
 
+    // Points-token state
+    const [pointsMeta, setPointsMeta] = useState(null);
+    const [pointsConfig, setPointsConfig] = useState({ token: null, creator: 0n, respondent: 0n });
+    const [pointsBalance, setPointsBalance] = useState(0n);
+    const [contractAdmin, setContractAdmin] = useState(null);
+
     // Shared landing (URL ?survey=<id>)
     const [sharedSurveyId, setSharedSurveyId] = useState(() => {
         if (typeof window === "undefined") return null;
@@ -133,6 +148,47 @@ export default function App() {
             { id, label, status: "error", error, startedAt: Date.now() },
             ...prev.slice(0, 7),
         ]);
+    }, []);
+
+    const refreshPointsConfig = useCallback(async () => {
+        try {
+            const cfg = await getSurveyPointsConfig();
+            const [token, creator, respondent] = Array.isArray(cfg) ? cfg : [null, 0n, 0n];
+            setPointsConfig({
+                token: token ? String(token) : null,
+                creator: typeof creator === "bigint" ? creator : BigInt(creator || 0),
+                respondent: typeof respondent === "bigint" ? respondent : BigInt(respondent || 0),
+            });
+        } catch {
+            setPointsConfig({ token: null, creator: 0n, respondent: 0n });
+        }
+        try {
+            const admin = await getSurveyContractAdmin();
+            setContractAdmin(admin ? String(admin) : null);
+        } catch {
+            setContractAdmin(null);
+        }
+        if (POINTS_TOKEN_ID) {
+            try {
+                const meta = await getPointsMetadata();
+                setPointsMeta(meta);
+            } catch {
+                setPointsMeta(null);
+            }
+        }
+    }, []);
+
+    const refreshPointsBalance = useCallback(async (address) => {
+        if (!address || !POINTS_TOKEN_ID) {
+            setPointsBalance(0n);
+            return;
+        }
+        try {
+            const value = await getPointsBalance(address);
+            setPointsBalance(typeof value === "bigint" ? value : BigInt(value || 0));
+        } catch {
+            setPointsBalance(0n);
+        }
     }, []);
 
     const refreshTotal = useCallback(async () => {
@@ -238,9 +294,15 @@ export default function App() {
                 refreshTotal();
                 refreshExplore();
             }
+            refreshPointsConfig();
         })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Refresh user's points balance whenever wallet identity changes.
+    useEffect(() => {
+        refreshPointsBalance(wallet?.publicKey || null);
+    }, [wallet, refreshPointsBalance]);
 
     // Shared survey loader
     useEffect(() => {
@@ -309,6 +371,8 @@ export default function App() {
             if (refresh?.explore) await refreshExplore();
             if (refresh?.responsesOf) await refreshResponses(refresh.responsesOf);
             if (refresh?.metaOf) await refreshSurveyMeta(refresh.metaOf);
+            if (refresh?.pointsBalance && wallet?.publicKey) await refreshPointsBalance(wallet.publicKey);
+            if (refresh?.pointsConfig) await refreshPointsConfig();
             return value;
         } catch (error) {
             const message = error?.message || String(error);
@@ -414,7 +478,7 @@ export default function App() {
             return result;
         }, {
             onSuccess: () => setCreateForm(emptyCreateForm()),
-            refresh: { total: true, explore: true },
+            refresh: { total: true, explore: true, pointsBalance: true },
         });
     };
 
@@ -620,8 +684,54 @@ export default function App() {
                     setSharedSurveyState((prev) => ({ ...prev, submitted: true, hasResponded: true }));
                 }
             },
-            refresh: sharedSurveyId ? {} : { explore: true, responsesOf: respondId },
+            refresh: sharedSurveyId
+                ? { pointsBalance: true }
+                : { explore: true, responsesOf: respondId, pointsBalance: true },
         });
+    };
+
+    // ---- token / admin setup ----
+    const onClaimSurveyAdmin = () => {
+        if (!requireWallet()) return;
+        run("init_admin", "Claim survey admin", () => initSurveyAdmin({ admin: wallet.publicKey }), {
+            refresh: { pointsConfig: true },
+        });
+    };
+
+    const onInitToken = ({ name, symbol, decimals }) => {
+        if (!requireWallet()) return;
+        if (!POINTS_TOKEN_ID) {
+            notifyError("Points token", "POINTS_TOKEN_ID is not configured in lib/stellar.js.");
+            return;
+        }
+        run("init_token", `Initialize ${symbol || "token"}`, () => initPointsToken({
+            admin: wallet.publicKey,
+            name,
+            symbol,
+            decimals: Number(decimals) || 0,
+        }), { refresh: { pointsConfig: true } });
+    };
+
+    const onSetTokenMinter = (minter) => {
+        if (!requireWallet()) return;
+        run("set_minter", "Authorize survey contract as minter", () => setPointsTokenMinter({
+            admin: wallet.publicKey,
+            minter,
+        }), { refresh: { pointsConfig: true } });
+    };
+
+    const onSavePointsConfig = ({ token, creatorPoints, respondentPoints }) => {
+        if (!requireWallet()) return;
+        if (!isValidContractId(String(token))) {
+            notifyError("Points config", "Token address is not a valid C… contract id.");
+            return;
+        }
+        run("set_points_cfg", "Save points configuration", () => setSurveyPointsConfig({
+            admin: wallet.publicKey,
+            token,
+            creatorPoints: BigInt(creatorPoints || 0),
+            respondentPoints: BigInt(respondentPoints || 0),
+        }), { refresh: { pointsConfig: true } });
     };
 
     // ---- analytics ----
@@ -746,6 +856,8 @@ export default function App() {
                     connecting={busyAction === "connect"}
                     submitting={busyAction === "respond"}
                     disabled={isBusy}
+                    pointsConfig={pointsConfig}
+                    pointsMeta={pointsMeta}
                 />
                 {createPortal(
                     <TxDrawer transactions={transactions} onDismiss={dismissTx} onClearAll={() => setTransactions([])} />,
@@ -805,6 +917,14 @@ export default function App() {
                         <span className="side-stat-label">Network</span>
                         <span className="side-stat-value mono small">{network || NETWORK_NAME}</span>
                     </div>
+                    {pointsMeta && (
+                        <div className="side-stat">
+                            <span className="side-stat-label">{pointsMeta.symbol || "PTS"} balance</span>
+                            <span className="side-stat-value">
+                                {wallet ? String(pointsBalance) : "—"}
+                            </span>
+                        </div>
+                    )}
                 </div>
 
                 <div className="side-wallet">
@@ -894,6 +1014,8 @@ export default function App() {
                             onSubmit={onCreate}
                             busyKey={busyAction}
                             disabled={isBusy}
+                            pointsConfig={pointsConfig}
+                            pointsMeta={pointsMeta}
                         />
                     )}
 
@@ -925,6 +1047,15 @@ export default function App() {
                             onSetVisibility={onSetVisibility}
                             onAddViewers={onAddViewers}
                             onRemoveViewer={onRemoveViewer}
+                            pointsConfig={pointsConfig}
+                            pointsMeta={pointsMeta}
+                            pointsBalance={pointsBalance}
+                            contractAdmin={contractAdmin}
+                            pointsTokenId={POINTS_TOKEN_ID}
+                            onClaimSurveyAdmin={onClaimSurveyAdmin}
+                            onInitToken={onInitToken}
+                            onSetTokenMinter={onSetTokenMinter}
+                            onSavePointsConfig={onSavePointsConfig}
                             busyAction={busyAction}
                             confirmKey={confirmKey}
                             disabled={isBusy}

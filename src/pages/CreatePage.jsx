@@ -2,12 +2,16 @@ import { localInputToUnix, formatUnix, formatRelative } from "../../lib/stellar.
 import Section from "../components/Section.jsx";
 import Field from "../components/Field.jsx";
 
-export default function CreatePage({ form, wallet, onTitleBlur, onChange, onSetQuestion, onAddQuestion, onRemoveQuestion, onSubmit, busyKey, disabled }) {
+export default function CreatePage({ form, wallet, onTitleBlur, onChange, onSetQuestion, onAddQuestion, onRemoveQuestion, onSubmit, busyKey, disabled, pointsConfig, pointsMeta }) {
     const endUnix = localInputToUnix(form.endTimeLocal);
     const rewardNum = Number(form.rewardXlm || "0");
     const maxNum = Number(form.maxResponses || "0");
     const totalEscrow = rewardNum > 0 ? rewardNum * maxNum : 0;
     const escrowError = rewardNum > 0 && maxNum <= 0;
+    const creatorPts = pointsConfig?.creator ? BigInt(pointsConfig.creator) : 0n;
+    const respondentPts = pointsConfig?.respondent ? BigInt(pointsConfig.respondent) : 0n;
+    const pointsActive = !!(pointsConfig?.token && (creatorPts > 0n || respondentPts > 0n));
+    const symbol = pointsMeta?.symbol || "PTS";
 
     return (
         <Section title="Create a Survey" tag="create_survey">
@@ -111,6 +115,18 @@ export default function CreatePage({ form, wallet, onTitleBlur, onChange, onSetQ
                 </span>
             </div>
 
+            {pointsActive && (
+                <div className="points-card">
+                    <div className="points-line">
+                        <span className="points-label">Reward points</span>
+                        <span className="points-value">+{String(creatorPts)} {symbol}</span>
+                    </div>
+                    <span className="hint">
+                        You'll earn {String(creatorPts)} {symbol} on publish, and each respondent receives {String(respondentPts)} {symbol} when they submit.
+                    </span>
+                </div>
+            )}
+
             <div className="row">
                 <button
                     type="button"
@@ -119,6 +135,7 @@ export default function CreatePage({ form, wallet, onTitleBlur, onChange, onSetQ
                     disabled={disabled || escrowError}
                 >
                     {totalEscrow > 0 ? `Publish & Escrow ${totalEscrow.toLocaleString(undefined, { maximumFractionDigits: 7 })} XLM` : "Publish Survey"}
+                    {pointsActive && creatorPts > 0n ? ` · +${String(creatorPts)} ${symbol}` : ""}
                 </button>
             </div>
         </Section>
