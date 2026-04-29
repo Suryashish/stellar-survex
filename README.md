@@ -9,7 +9,7 @@ A decentralized survey-builder dApp where creators publish surveys on-chain, esc
 [![Live demo](https://img.shields.io/badge/Live%20Demo-stellar--survex.vercel.app-ff5a1f?style=for-the-badge&logo=vercel&logoColor=white)](https://stellar-survex.vercel.app/)
 [![Network](https://img.shields.io/badge/Network-Stellar%20Testnet-4f46ff?style=for-the-badge&logo=stellar&logoColor=white)](https://stellar.expert/explorer/testnet)
 [![Built with](https://img.shields.io/badge/Built%20with-Soroban%20%2B%20React-00c46a?style=for-the-badge)](#-tech-stack)
-[![CI](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml/badge.svg)](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml)
+[![CI](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml)
 
 [**🚀 Open the live app →**](https://stellar-survex.vercel.app/)
 
@@ -111,7 +111,7 @@ Each `create_survey` and `submit_response` triggers a cross-contract `mint()` on
 </p>
 
 [![Vercel Deployment](https://img.shields.io/badge/Vercel-Deployed-black?logo=vercel)](https://stellar-survex.vercel.app/)
-[![CI](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml/badge.svg)](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml)
+[![CI](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml)
 
 Two pipelines run on every push to `main`:
 
