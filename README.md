@@ -7,6 +7,7 @@
 A decentralized survey-builder dApp where creators publish surveys on-chain, escrow XLM rewards inside a Soroban smart contract, and respondents are paid automatically the instant they submit a valid response. Both the creator and the respondent also earn **`SXP`** — a custom Soroban token (`SurvexPointsToken`) minted by a companion contract.
 
 [![Live demo](https://img.shields.io/badge/Live%20Demo-stellar--survex.vercel.app-ff5a1f?style=for-the-badge&logo=vercel&logoColor=white)](https://stellar-survex.vercel.app/)
+[![Demo Video](https://img.shields.io/badge/Demo%20Video-YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/mftY7EpaubI)
 [![Network](https://img.shields.io/badge/Network-Stellar%20Testnet-4f46ff?style=for-the-badge&logo=stellar&logoColor=white)](https://stellar.expert/explorer/testnet)
 [![Built with](https://img.shields.io/badge/Built%20with-Soroban%20%2B%20React-00c46a?style=for-the-badge)](#-tech-stack)
 [![CI](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Suryashish/stellar-survex/actions/workflows/ci.yml)
